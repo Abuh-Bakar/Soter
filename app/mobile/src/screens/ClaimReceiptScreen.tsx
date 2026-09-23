@@ -13,7 +13,7 @@ import { RootStackParamList } from '../navigation/types';
 import { useTheme } from '../theme/ThemeContext';
 import { AppColors } from '../theme/useAppTheme';
 import { ClaimReceipt, ClaimReceiptData } from '../components/ClaimReceipt';
-import { config } from '../config';
+import { fetchClaimReceipt, ReceiptApiError } from '../services/api';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'ClaimReceipt'>;
 
@@ -30,47 +30,31 @@ type LoadState =
   | { kind: 'ready'; data: ClaimReceiptData };
 
 export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
-  const { claimId } = route.params;
+  const identifier = route.params.packageId ?? route.params.claimId;
   const { colors } = useTheme();
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
 
   const loadClaim = useCallback(async () => {
+    if (!identifier) {
+      setState({ kind: 'error', message: 'A claim or package identifier is required.' });
+      return;
+    }
     setState({ kind: 'loading' });
     try {
-      const response = await fetch(
-        `${config.apiUrl}/claims/${encodeURIComponent(claimId)}/receipt`,
-      );
-
-      if (response.status === 404) {
+      const data = await fetchClaimReceipt(identifier);
+      setState({ kind: 'ready', data });
+    } catch (err) {
+      if (err instanceof ReceiptApiError && err.status === 404) {
         setState({ kind: 'not-found' });
         return;
       }
-
-      if (!response.ok) {
-        let msg = `Server responded with ${response.status}`;
-        try {
-          const body = (await response.json()) as
-            | { message?: string; error?: string }
-            | undefined;
-          if (body?.message) msg = body.message;
-          else if (body?.error) msg = body.error;
-        } catch {
-          /* ignore parse errors */
-        }
-        setState({ kind: 'error', message: msg });
-        return;
-      }
-
-      const data = (await response.json()) as ClaimReceiptData;
-      setState({ kind: 'ready', data });
-    } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Failed to load claim receipt';
       setState({ kind: 'error', message });
     }
-  }, [claimId]);
+  }, [identifier]);
 
   useEffect(() => {
     void loadClaim();
@@ -136,6 +120,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
 
   const claim = state.data;
   const isPending = PENDING_STATUSES.includes(claim.status);
+  const isFailed = claim.status === 'cancelled';
 
   return (
     <View style={styles.container}>
@@ -154,31 +139,31 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
           />
           <Text style={styles.headerTitle}>Claim Receipt</Text>
           <Text style={styles.headerSubtitle}>
-            Your proof of claim completion
+            {isFailed ? 'This claim was not completed' : isPending ? 'Your claim is still being processed' : 'Your proof of claim completion'}
           </Text>
         </View>
 
-        {/* Pending callout */}
-        {isPending && (
-          <View style={styles.pendingCallout}>
+        {(isPending || isFailed) && (
+          <View style={[styles.pendingCallout, isFailed && styles.failedCallout]}>
             <MaterialCommunityIcons
-              name="clock-outline"
+              name={isFailed ? 'close-circle-outline' : 'clock-outline'}
               size={20}
-              color={colors.brand.warning}
+              color={isFailed ? colors.brand.error : colors.brand.warning}
               style={{ marginRight: 8 }}
             />
             <View style={{ flex: 1 }}>
               <Text
                 style={[
                   styles.pendingTitle,
-                  { color: colors.brand.warning },
+                  { color: isFailed ? colors.brand.error : colors.brand.warning },
                 ]}
               >
-                Claim is {claim.status}
+                {isFailed ? 'Claim failed' : `Claim is ${claim.status}`}
               </Text>
-              <Text style={styles.pendingDescription}>
-                This claim has not been disbursed yet. A transaction link will
-                appear here once the on-chain disbursement is finalized.
+              <Text style={[styles.pendingDescription, isFailed && styles.failedDescription]}>
+                {isFailed
+                  ? 'This claim was cancelled and no disbursement was made.'
+                  : 'This claim has not been disbursed yet. A transaction link will appear here once the on-chain disbursement is finalized.'}
               </Text>
             </View>
           </View>
@@ -314,6 +299,10 @@ const makeStyles = (colors: AppColors) =>
       marginBottom: 16,
       alignItems: 'flex-start',
     },
+    failedCallout: {
+      backgroundColor: '#fef2f2',
+      borderColor: '#fecaca',
+    },
     pendingTitle: {
       fontSize: 13,
       fontWeight: '700',
@@ -322,6 +311,9 @@ const makeStyles = (colors: AppColors) =>
     pendingDescription: {
       fontSize: 12,
       color: '#92400e',
+    },
+    failedDescription: {
+      color: '#991b1b',
     },
     button: {
       paddingVertical: 12,

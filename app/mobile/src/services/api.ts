@@ -1,5 +1,46 @@
 import { config } from '../config';
 
+export interface ClaimReceiptData {
+  claimId: string;
+  packageId: string;
+  status: 'requested' | 'verified' | 'approved' | 'disbursed' | 'archived' | 'cancelled';
+  amount: number;
+  tokenAddress?: string;
+  transactionHash?: string;
+  contractId?: string;
+  timestamp: string;
+  recipientRef?: string;
+  explorerLink?: string;
+  receiptPointer?: string;
+}
+
+export class ReceiptApiError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'ReceiptApiError';
+  }
+}
+
+export const fetchClaimReceipt = async (
+  identifier: string,
+): Promise<ClaimReceiptData> => {
+  const response = await fetch(
+    `${config.apiUrl}/claims/${encodeURIComponent(identifier)}/receipt`,
+  );
+
+  if (!response.ok) {
+    let message = `Server responded with ${response.status}`;
+    try {
+      const body = (await response.json()) as { message?: string; error?: string };
+      message = body.message ?? body.error ?? message;
+    } catch {
+    }
+    throw new ReceiptApiError(response.status, message);
+  }
+
+  return (await response.json()) as ClaimReceiptData;
+};
+
 const API_URL = config.apiUrl;
 
 export interface HealthStatus {

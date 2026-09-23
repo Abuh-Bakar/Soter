@@ -545,7 +545,7 @@ export class ClaimsService {
    * Resolve a claim from either a claim ID or a package (campaign) identifier.
    * When given a package ID, returns the most recent claim for that package.
    */
-  private async resolveClaimByIdentifier(identifier: string): Promise<any> {
+  async resolveClaimByIdentifier(identifier: string): Promise<any> {
     // 1. Try direct claim ID lookup
     try {
       const directClaim = await this.findOne(identifier);
