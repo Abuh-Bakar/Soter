@@ -574,16 +574,12 @@ export class ClaimsService {
     return `${explorerBase}/testnet/tx/${transactionHash}`;
   }
 
-<<<<<<< HEAD
   /**
    * Resolve a claim from either a claim ID or a package (campaign) identifier.
    * When given a package ID, returns the most recent claim for that package.
    */
   async resolveClaimByIdentifier(identifier: string): Promise<any> {
     // 1. Try direct claim ID lookup
-=======
-  private async resolveClaimByIdentifier(identifier: string): Promise<any> {
->>>>>>> upstream/main
     try {
       const directClaim = await this.findOne(identifier);
       if (directClaim) return directClaim;
