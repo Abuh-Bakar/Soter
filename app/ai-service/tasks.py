@@ -4,11 +4,13 @@ Handles background task processing for heavy inference
 """
 
 import logging
+import os
 import uuid
 import time
 from typing import Any, Dict, Optional
 from celery import Celery
 from celery.result import AsyncResult
+from celery.schedules import crontab
 import httpx
 
 import metrics
@@ -55,6 +57,12 @@ def get_celery_app() -> Celery:
                 result_expires=86400,  # Results expire after 24 hours
                 task_acks_late=True,
                 task_reject_on_worker_lost=True,
+                beat_schedule={
+                    "purge-expired-evidence-uploads": {
+                        "task": "purge_expired_evidence_uploads",
+                        "schedule": crontab(minute=0),  # hourly
+                    },
+                },
             )
         except Exception as e:
             logger.warning(
@@ -85,7 +93,19 @@ def get_process_heavy_inference_task():
     ) -> Dict[str, Any]:
         try:
             return process_heavy_inference_impl(self, task_id, payload)
-        except Exception as exc:
+        except BaseException as exc:
+            if (
+                isinstance(exc, (KeyboardInterrupt, SystemExit))
+                or type(exc).__name__ == "WorkerShutdown"
+            ):
+                error_msg = "Task interrupted by worker shutdown"
+                logger.warning(
+                    f"Task {task_id} interrupted by shutdown. Dead-lettering."
+                )
+                handle_task_retries_exhausted(task_id, payload, error_msg)
+                raise
+            if not isinstance(exc, Exception):
+                raise
             if self.request.retries < settings.task_max_retries:
                 retry_delay = settings.task_retry_delay_seconds * (
                     2**self.request.retries
@@ -105,6 +125,27 @@ def get_process_heavy_inference_task():
             raise
 
     return process_heavy_inference_task
+
+
+def get_purge_expired_evidence_uploads_task():
+    """
+    Get the lazily-registered purge_expired_evidence_uploads task.
+
+    Removes abandoned upload sessions and expired evidence artifacts on the
+    schedule configured in ``get_celery_app``. Registered lazily so the task
+    exists only once Celery is actually available, matching the pattern used
+    by ``get_process_heavy_inference_task``.
+    """
+    app = get_celery_app()
+
+    @app.task(name="purge_expired_evidence_uploads")
+    def purge_expired_evidence_uploads_task() -> Dict[str, Any]:
+        from api.v1.uploads import run_evidence_upload_purge
+
+        dry_run = os.getenv("EVIDENCE_PURGE_DRY_RUN", "false").lower() == "true"
+        return run_evidence_upload_purge(dry_run=dry_run)
+
+    return purge_expired_evidence_uploads_task
 
 
 def handle_task_retries_exhausted(
@@ -337,7 +378,11 @@ def process_heavy_inference_impl(
         send_webhook_notification(task_id, "completed", result)
 
         inference_latency = time.time() - start_inference
-        metrics.INFERENCE_LATENCY.labels(task_type=task_type).observe(inference_latency)
+        # task_type originates from the client-supplied payload["type"]; bound
+        # it before it becomes a label value (metrics.py, issue #988).
+        metrics.INFERENCE_LATENCY.labels(
+            task_type=metrics.bounded_task_type(task_type)
+        ).observe(inference_latency)
 
         logger.info(
             f"Task {task_id} completed successfully in {inference_latency:.4f}s"
@@ -494,6 +539,7 @@ def _process_humanitarian_verification(payload: Dict[str, Any]) -> Dict[str, Any
         supporting_evidence=data.get("supporting_evidence", []),
         context_factors=data.get("context_factors", {}),
         provider_preference=data.get("provider_preference", "auto"),
+        prompt_version=data.get("prompt_version"),
     )
 
     return {
@@ -612,3 +658,9 @@ def expire_task(task_id: str) -> None:
     result = AsyncResult(task_id, app=get_celery_app())
     result.revoke(terminate=True)
     update_task_status(task_id, "expired")
+
+
+# Registered eagerly (unlike the on-demand inference task) so that celery
+# beat, which dispatches purely by task name, always finds it in the worker's
+# registry without needing a request to trigger registration first.
+get_purge_expired_evidence_uploads_task()

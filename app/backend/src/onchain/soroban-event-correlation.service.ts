@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { rpc as SorobanRpc, xdr, scValToNative } from '@stellar/stellar-sdk';
 import { MetricsService } from '../observability/metrics/metrics.service';
 import { withRetryTimeout } from './utils/retry-with-timeout';
+import { getNetworkProfile } from 'src/config/network.config';
 
 export interface EventCorrelationResult {
   correlated: number;
@@ -48,6 +49,9 @@ export class SorobanEventCorrelationService {
   private readonly rpcUrl: string;
   private readonly networkPassphrase: string;
   private server: SorobanRpc.Server | null = null;
+
+  // Known event schema versions that this service can handle
+  private readonly KNOWN_SCHEMA_VERSIONS = new Set([1]);
 
   // Event topics that we correlate
   private readonly CORRELATED_TOPICS = new Set([
@@ -106,17 +110,20 @@ export class SorobanEventCorrelationService {
     private readonly configService: ConfigService,
     private readonly metricsService: MetricsService,
   ) {
+    const networkProfile = getNetworkProfile(
+      this.configService.get<string>('SOROBAN_NETWORK'),
+    );
     this.contractId = this.configService.get<string>(
       'AID_ESCROW_CONTRACT_ID',
       '',
     );
     this.rpcUrl = this.configService.get<string>(
       'STELLAR_RPC_URL',
-      'https://soroban-testnet.stellar.org',
+      networkProfile.defaultRpcUrl,
     );
     this.networkPassphrase = this.configService.get<string>(
       'STELLAR_NETWORK_PASSPHRASE',
-      'Test SDF Network ; September 2015',
+      networkProfile.passphrase,
     );
   }
 
@@ -294,6 +301,41 @@ export class SorobanEventCorrelationService {
   }
 
   /**
+   * Extract and validate schema version from event payload
+   */
+  private extractSchemaVersion(payload: unknown): number | null {
+    if (payload && typeof payload === 'object' && 'schema_version' in payload) {
+      const version = payload.schema_version;
+      if (typeof version === 'number') {
+        return version;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Validate event schema version
+   * Logs warnings for unknown versions but does not fail
+   */
+  private validateSchemaVersion(
+    schemaVersion: number | null,
+    eventTopic: string,
+  ): void {
+    if (schemaVersion === null) {
+      this.logger.warn(
+        `Event '${eventTopic}' missing schema_version field - may be from pre-versioned contract`,
+      );
+      return;
+    }
+
+    if (!this.KNOWN_SCHEMA_VERSIONS.has(schemaVersion)) {
+      this.logger.warn(
+        `Event '${eventTopic}' has unknown schema version: ${schemaVersion}. Known versions: ${Array.from(this.KNOWN_SCHEMA_VERSIONS).join(', ')}`,
+      );
+    }
+  }
+
+  /**
    * Process events and create correlation records
    */
   private async processEvents(
@@ -363,6 +405,10 @@ export class SorobanEventCorrelationService {
         error: 'Already correlated',
       };
     }
+
+    // Validate schema version
+    const schemaVersion = this.extractSchemaVersion(event.payload);
+    this.validateSchemaVersion(schemaVersion, event.topic);
 
     // Extract claimId and packageId from event payload
     const { claimId, packageId } = this.extractIdentifiers(event);

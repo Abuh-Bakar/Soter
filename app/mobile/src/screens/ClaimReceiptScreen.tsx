@@ -13,7 +13,12 @@ import { RootStackParamList } from '../navigation/types';
 import { useTheme } from '../theme/ThemeContext';
 import { AppColors } from '../theme/useAppTheme';
 import { ClaimReceipt, ClaimReceiptData } from '../components/ClaimReceipt';
+<<<<<<< HEAD
 import { fetchClaimReceipt, ReceiptApiError } from '../services/api';
+=======
+import { config } from '../config';
+import { useTranslation } from '../i18n/useTranslation';
+>>>>>>> upstream/main
 
 type Props = NativeStackScreenProps<RootStackParamList, 'ClaimReceipt'>;
 
@@ -32,6 +37,7 @@ type LoadState =
 export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
   const identifier = route.params.packageId ?? route.params.claimId;
   const { colors } = useTheme();
+  const { t } = useTranslation();
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
@@ -68,7 +74,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
     return (
       <View style={[styles.container, styles.centered]}>
         <ActivityIndicator size="large" color={colors.brand.primary} />
-        <Text style={styles.loadingText}>Loading receipt…</Text>
+        <Text style={styles.loadingText}>{t('claimReceipt.loading')}</Text>
       </View>
     );
   }
@@ -82,7 +88,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
           color={colors.brand.warning}
           style={{ marginBottom: 16 }}
         />
-        <Text style={styles.errorTitle}>Receipt not found</Text>
+        <Text style={styles.errorTitle}>{t('claimReceipt.notFound')}</Text>
         <Text style={styles.errorMessage}>
           We could not find a receipt for this claim. The link may be incorrect
           or the claim may have been removed.
@@ -91,7 +97,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
           style={[styles.button, { backgroundColor: colors.brand.primary }]}
           onPress={handleClose}
         >
-          <Text style={styles.buttonText}>Go Back</Text>
+          <Text style={styles.buttonText}>{t('claimReceipt.goBack')}</Text>
         </TouchableOpacity>
       </View>
     );
@@ -106,13 +112,13 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
           color={colors.brand.error}
           style={{ marginBottom: 16 }}
         />
-        <Text style={styles.errorTitle}>Unable to load receipt</Text>
+        <Text style={styles.errorTitle}>{t('claimReceipt.unableToLoad')}</Text>
         <Text style={styles.errorMessage}>{state.message}</Text>
         <TouchableOpacity
           style={[styles.button, { backgroundColor: colors.brand.primary }]}
           onPress={handleClose}
         >
-          <Text style={styles.buttonText}>Go Back</Text>
+          <Text style={styles.buttonText}>{t('claimReceipt.goBack')}</Text>
         </TouchableOpacity>
       </View>
     );
@@ -137,7 +143,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
             color={colors.brand.primary}
             style={{ marginBottom: 8 }}
           />
-          <Text style={styles.headerTitle}>Claim Receipt</Text>
+          <Text style={styles.headerTitle}>{t('claimReceipt.title')}</Text>
           <Text style={styles.headerSubtitle}>
             {isFailed ? 'This claim was not completed' : isPending ? 'Your claim is still being processed' : 'Your proof of claim completion'}
           </Text>
@@ -176,7 +182,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
 
         {/* Help Section */}
         <View style={styles.helpSection}>
-          <Text style={styles.helpTitle}>How to use this receipt:</Text>
+          <Text style={styles.helpTitle}>{t('claimReceipt.howToUse')}</Text>
           <View style={styles.helpItem}>
             <MaterialCommunityIcons
               name="share-variant"
@@ -184,7 +190,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
               color={colors.brand.primary}
             />
             <View style={styles.helpText}>
-              <Text style={styles.helpItemTitle}>Share</Text>
+              <Text style={styles.helpItemTitle}>{t('claimReceipt.share')}</Text>
               <Text style={styles.helpItemDescription}>
                 Send this receipt to others using the native share sheet
               </Text>
@@ -197,7 +203,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
               color={colors.brand.primary}
             />
             <View style={styles.helpText}>
-              <Text style={styles.helpItemTitle}>Copy</Text>
+              <Text style={styles.helpItemTitle}>{t('claimReceipt.copy')}</Text>
               <Text style={styles.helpItemDescription}>
                 Copy the receipt text to clipboard for pasting elsewhere
               </Text>
@@ -211,7 +217,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
                 color={colors.brand.primary}
               />
               <View style={styles.helpText}>
-                <Text style={styles.helpItemTitle}>Verify on-chain</Text>
+                <Text style={styles.helpItemTitle}>{t('claimReceipt.verifyOnChain')}</Text>
                 <Text style={styles.helpItemDescription}>
                   Open the blockchain explorer to verify the transaction
                   independently
@@ -227,7 +233,7 @@ export const ClaimReceiptScreen: React.FC<Props> = ({ route, navigation }) => {
         style={[styles.closeButton, { backgroundColor: colors.brand.primary }]}
         onPress={handleClose}
       >
-        <Text style={styles.closeButtonText}>Done</Text>
+        <Text style={styles.closeButtonText}>{t('common.done')}</Text>
       </TouchableOpacity>
     </View>
   );

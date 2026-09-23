@@ -120,6 +120,27 @@ class CacheInvalidationHelper:
             )
         return deleted
 
+    def invalidate_verification_by_prompt_version(self, prompt_version: str) -> int:
+        """
+        Invalidate cached AI verification responses produced by a specific
+        prompt version, e.g. after updating the active prompt template version.
+
+        Args:
+            prompt_version: The prompt version string (e.g. "v1", "v2")
+
+        Returns:
+            Number of keys deleted
+        """
+        sanitized = CacheService._sanitize_tag_value(prompt_version)
+        pattern = f"cache:ai:humanitarian_verification:*prompt_version={sanitized}*"
+        deleted = self.cache.delete_pattern(pattern)
+        metrics.CACHE_INVALIDATION_TOTAL.labels(reason="prompt_version_changed").inc()
+        if deleted > 0:
+            logger.info(
+                f"Invalidated {deleted} verification cache entries for prompt version {prompt_version}"
+            )
+        return deleted
+
     def invalidate_all(self) -> int:
         """
         Invalidate all AI service caches (nuclear option).

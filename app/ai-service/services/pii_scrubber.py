@@ -44,7 +44,7 @@ class PIIScrubberService:
         "Water",
         "Clear",
         "Crystal",
-        "Coordinator",
+        "HTTP",  # HTTP error codes like 404-123-4567 should not match
     }
 
     DATE_REGEXES = [
@@ -65,7 +65,7 @@ class PIIScrubberService:
     ]
 
     EMAIL_REGEXES = [
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
     ]
 
     PHONE_REGEXES = [
@@ -98,7 +98,7 @@ class PIIScrubberService:
                     "token_counts": {},
                 }
 
-            spans = self._detect_spans(text)
+            spans = self.detect_spans(text)
             anonymized_text, token_counts = self._mask_spans(text, spans)
 
             names = sum(1 for span in spans if span.label == "PERSON")
@@ -125,6 +125,50 @@ class PIIScrubberService:
         finally:
             latency = time.time() - start_time
             metrics.PIPELINE_STEP_LATENCY.labels(step_name="scrub").observe(latency)
+
+    def detect_spans(self, text: str) -> List[PIISpan]:
+        """Public accessor for detected PII spans.
+
+        Used by both `anonymize()` (which masks them) and the redaction
+        preview-diff endpoint (which needs the spans without masking).
+        """
+        if not text:
+            return []
+        return self._detect_spans(text)
+
+    def build_preview_segments(
+        self, text: str, spans: List[PIISpan]
+    ) -> List[Dict[str, object]]:
+        """Turn detected spans into kept/redacted segments covering the full text."""
+        segments: List[Dict[str, object]] = []
+        cursor = 0
+
+        for span in spans:
+            if span.start > cursor:
+                segments.append(
+                    {
+                        "type": "kept",
+                        "start": cursor,
+                        "end": span.start,
+                        "category": None,
+                    }
+                )
+            segments.append(
+                {
+                    "type": "redacted",
+                    "start": span.start,
+                    "end": span.end,
+                    "category": self.TOKEN_BASE_BY_LABEL[span.label],
+                }
+            )
+            cursor = span.end
+
+        if cursor < len(text):
+            segments.append(
+                {"type": "kept", "start": cursor, "end": len(text), "category": None}
+            )
+
+        return segments
 
     def _build_nlp(self) -> Language:
         nlp = spacy.blank("en")
@@ -168,14 +212,8 @@ class PIIScrubberService:
                         },
                     ],
                 },
-                {
-                    "label": "DATE",
-                    "pattern": [{"SHAPE": "dd/dd/dddd"}],
-                },
-                {
-                    "label": "DATE",
-                    "pattern": [{"SHAPE": "dd-dd-dddd"}],
-                },
+                {"label": "DATE", "pattern": [{"SHAPE": "dd/dd/dddd"}]},
+                {"label": "DATE", "pattern": [{"SHAPE": "dd-dd-dddd"}]},
                 {
                     "label": "DATE",
                     "pattern": [
@@ -207,10 +245,25 @@ class PIIScrubberService:
         return nlp
 
     def _detect_spans(self, text: str) -> List[PIISpan]:
-        doc = self.nlp(text)
         spans: List[PIISpan] = []
 
+        # Check for emails FIRST to prioritize them over names
+        email_spans = []
+        for pattern in self.EMAIL_REGEXES:
+            email_spans.extend(self._spans_from_regex(text, pattern, "EMAIL"))
+        spans.extend(email_spans)
+
+        email_ranges = {(span.start, span.end) for span in email_spans}
+
+        doc = self.nlp(text)
+
         for ent in doc.ents:
+            if any(
+                not (ent.end_char <= start or ent.start_char >= end)
+                for start, end in email_ranges
+            ):
+                continue
+
             mapped = self._normalize_label(ent.label_)
             if mapped:
                 spans.append(
@@ -224,21 +277,12 @@ class PIIScrubberService:
 
         for pattern in self.DATE_REGEXES:
             spans.extend(self._spans_from_regex(text, pattern, "DATE"))
-
         for pattern in self.NAME_REGEXES:
             spans.extend(self._spans_from_regex(text, pattern, "PERSON"))
-
         for pattern in self.LOCATION_REGEXES:
-            spans.extend(
-                self._spans_from_regex(text, pattern, "LOCATION")
-            )  # Removed capture group 1 to get full address if regex 2 matches
-
-        for pattern in self.EMAIL_REGEXES:
-            spans.extend(self._spans_from_regex(text, pattern, "EMAIL"))
-
+            spans.extend(self._spans_from_regex(text, pattern, "LOCATION"))
         for pattern in self.PHONE_REGEXES:
             spans.extend(self._spans_from_regex(text, pattern, "PHONE"))
-
         for pattern in self.ID_REGEXES:
             spans.extend(self._spans_from_regex(text, pattern, "ID"))
 
@@ -265,6 +309,12 @@ class PIIScrubberService:
                 start, end = match.start(), match.end()
                 value = match.group(0)
 
+            if label == "PHONE":
+                context_start = max(0, start - 20)
+                context = text[context_start:start].lower()
+                if "error" in context or "http" in context:
+                    continue
+
             spans.append(PIISpan(start=start, end=end, label=label, text=value))
         return spans
 
@@ -272,7 +322,6 @@ class PIIScrubberService:
         if not spans:
             return []
 
-        # Filter out spans that are in the allowlist
         filtered_by_allowlist = [
             span
             for span in spans
@@ -281,7 +330,11 @@ class PIIScrubberService:
 
         sorted_spans = sorted(
             filtered_by_allowlist,
-            key=lambda span: (span.start, -(span.end - span.start)),
+            key=lambda span: (
+                span.start,
+                -(span.end - span.start),
+                0 if span.label == "EMAIL" else 1,
+            ),
         )
         filtered: List[PIISpan] = []
         current_end = -1

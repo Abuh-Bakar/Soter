@@ -8,6 +8,7 @@ import {
   StyleSheet,
   Modal,
   ScrollView,
+  Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -15,8 +16,10 @@ import { RootStackParamList } from '../navigation/types';
 import { SubmissionStatusBadge } from '../components/SubmissionStatusBadge';
 import { QueuedSyncAction, mapConflictErrorMessage, isConflictError } from '../services/syncQueue';
 import { useSync } from '../contexts/SyncContext';
+import { useSyncDeferral } from '../contexts/SyncDeferralContext';
 import { useTheme } from '../theme/ThemeContext';
 import { AppColors } from '../theme/useAppTheme';
+import { useTranslation } from '../i18n/useTranslation';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'SubmissionQueue'>;
 
@@ -66,9 +69,21 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
     retryAction,
     requeueAction,
     discardAction,
+    deferralStatus,
+    forceSync,
   } = useSync();
 
+  const { 
+    batteryLevel, 
+    isCharging, 
+    isMetered, 
+    meteredOptIn, 
+    setMeteredOptIn,
+    forceSync: forceSyncDeferral,
+  } = useSyncDeferral();
+
   const { colors } = useTheme();
+  const { t } = useTranslation();
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
   const [activeTab, setActiveTab] = useState<FilterTab>('all');
@@ -101,6 +116,28 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
     await discardAction(actionId);
   };
 
+  const handleForceSync = async () => {
+    try {
+      await forceSync();
+    } catch (error) {
+      Alert.alert('Force Sync Failed', 'Failed to force sync. Please try again.');
+    }
+  };
+
+  const handleMeteredOptIn = async () => {
+    try {
+      await setMeteredOptIn(!meteredOptIn);
+      Alert.alert(
+        'Metered Connection Sync',
+        meteredOptIn 
+          ? 'Sync on metered connections disabled' 
+          : 'Sync on metered connections enabled. Be aware of data usage costs.',
+      );
+    } catch (error) {
+      Alert.alert('Settings Error', 'Failed to update metered sync preference.');
+    }
+  };
+
   const renderItem = ({ item }: { item: QueuedSyncAction }) => {
     const actionLabel = ACTION_LABELS[item.type] ?? item.type;
     const isConflict = item.state === 'conflict' || isConflictError(item.lastError);
@@ -123,14 +160,14 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
         </View>
 
         <View style={styles.detailRow}>
-          <Text style={styles.detailLabel}>Retries</Text>
+          <Text style={styles.detailLabel}>{t('submissionQueue.retries')}</Text>
           <Text style={styles.detailValue}>
             {item.retryCount} / {item.maxRetries}
           </Text>
         </View>
 
         <View style={styles.detailRow}>
-          <Text style={styles.detailLabel}>Updated</Text>
+          <Text style={styles.detailLabel}>{t('submissionQueue.updated')}</Text>
           <Text style={styles.detailValue}>{formatDateTime(item.updatedAt)}</Text>
         </View>
 
@@ -145,6 +182,12 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
           </View>
         ) : null}
 
+        {item.deferralReason ? (
+          <View style={styles.deferralBox}>
+            <Text style={styles.deferralLabel}>Deferred: {item.deferralReason}</Text>
+          </View>
+        ) : null}
+
         <View style={styles.actionRow}>
           <TouchableOpacity
             style={styles.inspectButton}
@@ -153,7 +196,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
             accessibilityLabel="Inspect item details"
             testID={`inspect-button-${item.id}`}
           >
-            <Text style={styles.inspectButtonText}>Inspect Details</Text>
+            <Text style={styles.inspectButtonText}>{t('submissionQueue.inspectDetails')}</Text>
           </TouchableOpacity>
 
           {(item.state === 'failed' || item.state === 'conflict' || item.state === 'retrying') && (
@@ -164,7 +207,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
               accessibilityLabel="Requeue item"
               testID={`requeue-button-${item.id}`}
             >
-              <Text style={styles.requeueButtonText}>Requeue</Text>
+              <Text style={styles.requeueButtonText}>{t('submissionQueue.requeue')}</Text>
             </TouchableOpacity>
           )}
 
@@ -175,7 +218,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
             accessibilityLabel="Discard item"
             testID={`discard-button-${item.id}`}
           >
-            <Text style={styles.discardButtonText}>Discard</Text>
+            <Text style={styles.discardButtonText}>{t('submissionQueue.discard')}</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -185,7 +228,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.summary}>
-        <Text style={styles.title}>Submission Queue</Text>
+        <Text style={styles.title}>{t('submissionQueue.title')}</Text>
 
         <Text style={styles.summaryText}>
           {isConnected ? 'Online' : 'Offline'} · {pendingCount} pending · {failedCount} failed · {conflictCount} conflict
@@ -199,17 +242,59 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
           <Text style={styles.errorSummary}>Last sync error: {lastSyncError}</Text>
         ) : null}
 
-        <TouchableOpacity
-          style={[styles.refreshButton, isSyncing && styles.refreshButtonDisabled]}
-          onPress={flushNow}
-          disabled={isSyncing}
-          accessibilityRole="button"
-          accessibilityLabel="Sync queued submissions now"
-        >
-          <Text style={styles.refreshButtonText}>
-            {isSyncing ? 'Syncing...' : 'Sync Now'}
-          </Text>
-        </TouchableOpacity>
+        {deferralStatus?.deferred ? (
+          <View style={styles.deferralBox}>
+            <Text style={styles.deferralLabel}>{t('submissionQueue.syncDeferred')}</Text>
+            <Text style={styles.deferralText}>{deferralStatus.explanation}</Text>
+          </View>
+        ) : null}
+
+        <View style={styles.syncButtonRow}>
+          <TouchableOpacity
+            style={[styles.refreshButton, isSyncing && styles.refreshButtonDisabled]}
+            onPress={flushNow}
+            disabled={isSyncing}
+            accessibilityRole="button"
+            accessibilityLabel="Sync queued submissions now"
+          >
+            <Text style={styles.refreshButtonText}>
+              {isSyncing ? 'Syncing...' : 'Sync Now'}
+            </Text>
+          </TouchableOpacity>
+
+          {deferralStatus?.deferred ? (
+            <TouchableOpacity
+              style={[styles.forceSyncButton, isSyncing && styles.refreshButtonDisabled]}
+              onPress={handleForceSync}
+              disabled={isSyncing}
+              accessibilityRole="button"
+              accessibilityLabel="Force sync now"
+            >
+              <Text style={styles.forceSyncButtonText}>
+                Force Sync
+              </Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
+
+        {isMetered && (
+          <TouchableOpacity
+            style={[
+              styles.meteredOptInButton,
+              meteredOptIn ? styles.meteredOptInEnabled : styles.meteredOptInDisabled
+            ]}
+            onPress={handleMeteredOptIn}
+            accessibilityRole="button"
+            accessibilityLabel={`Toggle metered connection sync (currently ${meteredOptIn ? 'enabled' : 'disabled'})`}
+          >
+            <Text style={[
+              styles.meteredOptInText,
+              meteredOptIn ? styles.meteredOptInTextEnabled : styles.meteredOptInTextDisabled
+            ]}>
+              {meteredOptIn ? '✓ Sync on metered: ON' : '✗ Sync on metered: OFF'}
+            </Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       <View style={styles.tabsContainer}>
@@ -255,7 +340,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
         }
         ListEmptyComponent={
           <View style={styles.emptyState}>
-            <Text style={styles.emptyTitle}>No queued submissions</Text>
+            <Text style={styles.emptyTitle}>{t('submissionQueue.empty')}</Text>
             <Text style={styles.emptyText}>
               {activeTab === 'all'
                 ? 'Offline submissions will appear here until they are synced.'
@@ -277,36 +362,36 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
             <View style={styles.modalContent}>
               <ScrollView contentContainerStyle={styles.modalScroll}>
                 <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Inspect Submission Item</Text>
+                  <Text style={styles.modalTitle}>{t('submissionQueue.inspectItem')}</Text>
                   <SubmissionStatusBadge state={selectedAction.state} />
                 </View>
 
                 <View style={styles.modalSection}>
-                  <Text style={styles.modalSectionTitle}>Action Details</Text>
+                  <Text style={styles.modalSectionTitle}>{t('submissionQueue.actionDetails')}</Text>
                   <View style={styles.modalRow}>
-                    <Text style={styles.modalLabel}>Action ID:</Text>
+                    <Text style={styles.modalLabel}>{t('submissionQueue.actionId')}</Text>
                     <Text style={styles.modalValue}>{selectedAction.id}</Text>
                   </View>
                   <View style={styles.modalRow}>
-                    <Text style={styles.modalLabel}>Type:</Text>
+                    <Text style={styles.modalLabel}>{t('submissionQueue.type')}</Text>
                     <Text style={styles.modalValue}>
                       {ACTION_LABELS[selectedAction.type] ?? selectedAction.type}
                     </Text>
                   </View>
                   <View style={styles.modalRow}>
-                    <Text style={styles.modalLabel}>Created:</Text>
+                    <Text style={styles.modalLabel}>{t('submissionQueue.created')}</Text>
                     <Text style={styles.modalValue}>
                       {formatDateTime(selectedAction.createdAt)}
                     </Text>
                   </View>
                   <View style={styles.modalRow}>
-                    <Text style={styles.modalLabel}>Last Updated:</Text>
+                    <Text style={styles.modalLabel}>{t('submissionQueue.lastUpdated')}</Text>
                     <Text style={styles.modalValue}>
                       {formatDateTime(selectedAction.updatedAt)}
                     </Text>
                   </View>
                   <View style={styles.modalRow}>
-                    <Text style={styles.modalLabel}>Retries:</Text>
+                    <Text style={styles.modalLabel}>{t('submissionQueue.retriesLabel')}</Text>
                     <Text style={styles.modalValue}>
                       {selectedAction.retryCount} / {selectedAction.maxRetries}
                     </Text>
@@ -342,17 +427,34 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
                       {mapConflictErrorMessage(selectedAction.lastError)}
                     </Text>
 
-                    <Text style={[styles.modalLabel, { marginTop: 8 }]}>Raw Backend Response:</Text>
+                    <Text style={[styles.modalLabel, { marginTop: 8 }]}>{t('submissionQueue.rawBackendResponse')}</Text>
                     <Text style={styles.rawErrorText}>{selectedAction.lastError}</Text>
                   </View>
                 ) : null}
 
                 <View style={styles.modalSection}>
-                  <Text style={styles.modalSectionTitle}>Payload Parameters</Text>
+                  <Text style={styles.modalSectionTitle}>{t('submissionQueue.payloadParameters')}</Text>
                   <Text style={styles.payloadCode}>
                     {JSON.stringify(selectedAction.payload, null, 2)}
                   </Text>
                 </View>
+
+                {selectedAction.deferralReason ? (
+                  <View style={styles.modalSection}>
+                    <Text style={styles.modalSectionTitle}>{t('submissionQueue.deferralInformation')}</Text>
+                    <View style={styles.deferralBox}>
+                      <Text style={styles.deferralLabel}>Reason: {selectedAction.deferralReason}</Text>
+                      {selectedAction.deferralLog && selectedAction.deferralLog.length > 0 ? (
+                        <View>
+                          <Text style={styles.deferralLabel}>{t('submissionQueue.deferralLog')}</Text>
+                          {selectedAction.deferralLog.map((log, index) => (
+                            <Text key={index} style={styles.deferralText}>{log}</Text>
+                          ))}
+                        </View>
+                      ) : null}
+                    </View>
+                  </View>
+                ) : null}
               </ScrollView>
 
               <View style={styles.modalFooter}>
@@ -362,7 +464,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
                   accessibilityRole="button"
                   accessibilityLabel="Requeue submission item"
                 >
-                  <Text style={styles.modalBtnText}>Requeue</Text>
+                  <Text style={styles.modalBtnText}>{t('submissionQueue.requeue')}</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
@@ -371,7 +473,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
                   accessibilityRole="button"
                   accessibilityLabel="Discard submission item"
                 >
-                  <Text style={styles.modalBtnText}>Discard</Text>
+                  <Text style={styles.modalBtnText}>{t('submissionQueue.discard')}</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
@@ -380,7 +482,7 @@ export const SubmissionQueueScreen: React.FC<Props> = () => {
                   accessibilityRole="button"
                   accessibilityLabel="Close inspection details"
                 >
-                  <Text style={styles.modalCloseText}>Close</Text>
+                  <Text style={styles.modalCloseText}>{t('common.close')}</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -417,13 +519,69 @@ const makeStyles = (colors: AppColors) =>
       fontSize: 13,
       color: colors.error,
     },
-    refreshButton: {
+    deferralBox: {
       marginTop: 8,
-      alignSelf: 'flex-start',
+      borderRadius: 6,
+      padding: 10,
+      backgroundColor: '#FEF3C7',
+      borderWidth: 1,
+      borderColor: '#F59E0B',
+    },
+    deferralLabel: {
+      fontSize: 12,
+      fontWeight: '700',
+      color: '#92400E',
+    },
+    deferralText: {
+      fontSize: 12,
+      color: '#92400E',
+    },
+    syncButtonRow: {
+      flexDirection: 'row',
+      gap: 8,
+      marginTop: 8,
+    },
+    refreshButton: {
       borderRadius: 6,
       backgroundColor: colors.primary,
       paddingHorizontal: 14,
       paddingVertical: 8,
+    },
+    forceSyncButton: {
+      borderRadius: 6,
+      backgroundColor: '#F59E0B',
+      paddingHorizontal: 14,
+      paddingVertical: 8,
+    },
+    forceSyncButtonText: {
+      color: '#FFFFFF',
+      fontSize: 14,
+      fontWeight: '700',
+    },
+    meteredOptInButton: {
+      marginTop: 8,
+      borderRadius: 6,
+      paddingHorizontal: 14,
+      paddingVertical: 8,
+      borderWidth: 1,
+    },
+    meteredOptInEnabled: {
+      backgroundColor: '#D1FAE5',
+      borderColor: '#10B981',
+    },
+    meteredOptInDisabled: {
+      backgroundColor: '#FEE2E2',
+      borderColor: '#EF4444',
+    },
+    meteredOptInText: {
+      fontSize: 12,
+      fontWeight: '600',
+    },
+    meteredOptInTextEnabled: {
+      color: '#065F46',
+    },
+    meteredOptInTextDisabled: {
+      color: '#991B1B',
     },
     refreshButtonDisabled: {
       opacity: 0.6,
