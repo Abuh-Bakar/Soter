@@ -13,12 +13,8 @@ import { RootStackParamList } from '../navigation/types';
 import { useTheme } from '../theme/ThemeContext';
 import { AppColors } from '../theme/useAppTheme';
 import { ClaimReceipt, ClaimReceiptData } from '../components/ClaimReceipt';
-<<<<<<< HEAD
 import { fetchClaimReceipt, ReceiptApiError } from '../services/api';
-=======
-import { config } from '../config';
 import { useTranslation } from '../i18n/useTranslation';
->>>>>>> upstream/main
 
 type Props = NativeStackScreenProps<RootStackParamList, 'ClaimReceipt'>;
 

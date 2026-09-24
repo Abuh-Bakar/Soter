@@ -1,4 +1,5 @@
-<<<<<<< HEAD
+import { guardAgainstPinningFailure } from './certificatePinning';
+import { apiGet } from './requestLayer';
 import { config } from '../config';
 
 export interface ClaimReceiptData {
@@ -41,13 +42,6 @@ export const fetchClaimReceipt = async (
 
   return (await response.json()) as ClaimReceiptData;
 };
-
-const API_URL = config.apiUrl;
-=======
-import { guardAgainstPinningFailure } from './certificatePinning';
-import { structuredLogger } from './logger';
-import { apiGet } from './requestLayer';
->>>>>>> upstream/main
 
 export interface HealthStatus {
   status: string;
