@@ -70,6 +70,10 @@ interface RawClaimExportRow {
   metadata: unknown;
 }
 
+type ClaimWithCampaign = Prisma.ClaimGetPayload<{
+  include: { campaign: true };
+}>;
+
 type ExpirationCleanupCapableAdapter = OnchainAdapter & {
   revokeAidPackage?: (params: {
     packageId: string;
@@ -578,7 +582,9 @@ export class ClaimsService {
    * Resolve a claim from either a claim ID or a package (campaign) identifier.
    * When given a package ID, returns the most recent claim for that package.
    */
-  async resolveClaimByIdentifier(identifier: string): Promise<any> {
+  async resolveClaimByIdentifier(
+    identifier: string,
+  ): Promise<ClaimWithCampaign> {
     // 1. Try direct claim ID lookup
     try {
       const directClaim = await this.findOne(identifier);
