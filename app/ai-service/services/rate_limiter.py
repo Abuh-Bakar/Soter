@@ -300,10 +300,7 @@ class RateLimiterService:
             pipe = client.pipeline()
             pipe.zadd(
                 rkey,
-                {
-                    f"{now}:{uuid.uuid4().hex}:{index}": now
-                    for index in range(cost)
-                },
+                {f"{now}:{uuid.uuid4().hex}:{index}": now for index in range(cost)},
             )
             pipe.expire(rkey, window_seconds + 5)
             pipe.execute()
