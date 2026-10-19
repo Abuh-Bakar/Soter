@@ -15,6 +15,7 @@ import { TaskItem, fetchTaskList, getMockTaskList } from '../services/taskApi';
 import { cacheTaskList, loadCachedTaskList, getTaskCacheTimestamp } from '../services/taskCache';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { OfflineBanner } from '../components/OfflineBanner';
+import { ConnectionQualityBanner } from '../components/ConnectionQualityBanner';
 import { DataFreshnessIndicator } from '../components/DataFreshnessIndicator';
 import { useTheme } from '../theme/ThemeContext';
 import { AppColors } from '../theme/useAppTheme';
@@ -108,7 +109,7 @@ export const TaskListScreen: React.FC<Props> = ({ navigation }) => {
     await loadData(false);
   }, [isCached, loadData]);
 
-  const { isConnected } = useNetworkStatus(handleReconnect);
+  const { isConnected, networkQuality } = useNetworkStatus(handleReconnect);
 
   useEffect(() => {
     loadData();
@@ -198,6 +199,7 @@ export const TaskListScreen: React.FC<Props> = ({ navigation }) => {
   return (
     <SafeAreaView style={styles.container}>
       <OfflineBanner visible={!isConnected} cachedAt={cachedAt} pendingCount={0} />
+      <ConnectionQualityBanner visible={isConnected && networkQuality === 'degraded'} />
       <DataFreshnessIndicator isCached={isCached} isConnected={isConnected} cachedAt={cachedAt} refreshing={refreshing} refreshMessage={refreshMessage} onRefresh={() => loadData(true)} />
 
       <FlatList

@@ -29,7 +29,8 @@
     "languageNameEn": "English",
     "languageNameEs": "Spanish",
     "languageNameFr": "French",
-    "done": "Done"
+    "done": "Done",
+    "continue": "Continue"
   },
   "navigation": {
     "home": "Home",
@@ -86,7 +87,16 @@
     "disconnect": "Disconnect",
     "copyAddress": "Copy Address",
     "addressCopied": "Address copied to clipboard",
-    "explorer": "View on Explorer"
+    "explorer": "View on Explorer",
+    "differentWalletDetected": "Different wallet detected",
+    "differentWalletWarning": "This is a different wallet than before. You previously connected {previousAddress}, but this session is trying to connect {newAddress}. Continue only if you intend to switch wallets.",
+    "sameWalletWarning": "This wallet matches the one already connected to this device."
+  },
+  "network": {
+    "qualityDegradedBadge": "Slow",
+    "qualityDegradedTitle": "Slow connection",
+    "qualityDegradedMessage": "Actions may take longer while the network recovers.",
+    "qualityDegradedLabel": "Slow connection. The network is available but responding slowly."
   },
   "settings": {
     "title": "Settings",
