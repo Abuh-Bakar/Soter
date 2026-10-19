@@ -490,12 +490,19 @@ async def verify_humanitarian_claim(
         artifact_tag = (
             ",".join(sorted(request.artifact_ids)) if request.artifact_ids else ""
         )
+        evidence_content_hash = _compute_evidence_content_hash(
+            request.artifact_ids, artifact_access_control
+        )
         anchor = request.anchor_metadata
         claim_id = getattr(anchor, "claim_id", None)
         identity = (
-            f"claim:{claim_id}"
+            f"claim:{claim_id}:content:{evidence_content_hash}"
             if claim_id
-            else f"artifacts:{artifact_tag}" if artifact_tag else None
+            else (
+                f"artifacts:{artifact_tag}:content:{evidence_content_hash}"
+                if artifact_tag
+                else None
+            )
         )
         org_scope = (
             x_org_id.strip()
@@ -519,13 +526,7 @@ async def verify_humanitarian_claim(
         if cooldown_result is not None:
             response.headers["X-Verification-Cooldown"] = "true"
 
-        content_hash = (
-            ""
-            if stream
-            else _compute_evidence_content_hash(
-                request.artifact_ids, artifact_access_control
-            )
-        )
+        content_hash = "" if stream else evidence_content_hash
 
         if stream:
             if cooldown_result is not None:
