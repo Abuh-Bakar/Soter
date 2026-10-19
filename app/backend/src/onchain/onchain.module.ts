@@ -10,6 +10,7 @@ import { OnchainProcessor } from './onchain.processor';
 import { OnchainService } from './onchain.service';
 import { LedgerBackfillService } from './ledger-backfill.service';
 import { LedgerReconciliationService } from './ledger-reconciliation.service';
+import { LedgerReconciliationAlertService } from './ledger-reconciliation-alert.service';
 import { LedgerAdminController } from './ledger-admin.controller';
 import { AdminTransferController } from './admin-transfer.controller';
 import { AdminTransferService } from './admin-transfer.service';
@@ -29,6 +30,7 @@ import { SorobanEventCorrelationScheduler } from './soroban-event-correlation.sc
 import { SorobanCorrelationTraceService } from './soroban-correlation-trace.service';
 import { PrismaModule } from '../prisma/prisma.module';
 import { CommonServicesModule } from '../common/services/common-services.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 const skipBackgroundJobs = process.env.SKIP_BACKGROUND_JOBS === 'true';
 
@@ -98,6 +100,7 @@ const onchainAdapterProvider: Provider = {
     LoggerModule,
     MetricsModule,
     CommonServicesModule,
+    NotificationsModule,
   ],
   controllers: [
     LedgerAdminController,
@@ -114,6 +117,7 @@ const onchainAdapterProvider: Provider = {
     StellarLedgerSource,
     LedgerBackfillService,
     LedgerReconciliationService,
+    LedgerReconciliationAlertService,
     SurplusWithdrawalService,
     AdminTransferService,
     ActionPauseService,
@@ -130,6 +134,7 @@ const onchainAdapterProvider: Provider = {
     StellarLedgerSource,
     LedgerBackfillService,
     LedgerReconciliationService,
+    LedgerReconciliationAlertService,
     SurplusWithdrawalService,
     SorobanTransactionLifecycleService,
     SorobanTransactionScheduler,
