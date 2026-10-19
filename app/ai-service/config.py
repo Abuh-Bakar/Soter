@@ -129,6 +129,7 @@ class Settings(BaseSettings):
 
     # Request throttling / Rate limiting
     request_rate_limit: str = "10/minute"
+    # Batch OCR consumes one per-key rate-limit unit per uploaded document.
     rate_limit_per_key_default: str = "60/minute"
     rate_limit_endpoint_overrides: Dict[str, str] = Field(
         default_factory=lambda: {

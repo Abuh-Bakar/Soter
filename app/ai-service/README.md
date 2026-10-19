@@ -127,7 +127,13 @@ Response body:
 curl -X POST "http://localhost:8000/ai/ocr" -F "image=@document.jpg"
 ```
 
-**Rate limit:** 10 requests/minute per IP
+**Rate limits:** OCR requests retain the per-IP `REQUEST_RATE_LIMIT` (default
+`10/minute`) and also use the shared per-key sliding-window budget
+`RATE_LIMIT_PER_KEY_DEFAULT` (default `60/minute`), with optional
+`RATE_LIMIT_ENDPOINT_OVERRIDES` by route. Batch OCR charges one per-key unit
+for each uploaded document, rather than one unit for the whole submission.
+For example, a four-document batch uses four units; if the remaining budget is
+too small, the request is rejected with HTTP 429 before any OCR jobs are queued.
 
 ### Request Safety Limits
 
