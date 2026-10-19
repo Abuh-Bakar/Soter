@@ -1,11 +1,5 @@
-import {
-  Injectable,
-  BadRequestException,
-  NotFoundException,
-  Optional,
-  Inject,
-  Logger,
-} from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable, Optional, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
@@ -14,6 +8,7 @@ import { ClaimReceiptDto, SendReceiptShareDto } from './dto/claim-receipt.dto';
 import { explorerTxUrl } from '../common/utils/explorer-url.util';
 import { ExportClaimsQueryDto } from './dto/export-claims.dto';
 import {
+  CancelReasonCode,
   ClaimStatus,
   Prisma,
   SorobanOperationType,
@@ -33,6 +28,9 @@ import { SorobanTransactionLifecycleService } from '../onchain/soroban-transacti
 import { SorobanTransactionScheduler } from '../onchain/soroban-transaction.scheduler';
 import { escapeCsvField, toCsvRow } from '../common/csv/csv.util';
 import { streamCursorPaginated } from '../common/streaming/cursor-paginate';
+import { VerificationService } from '../verification/verification.service';
+import { readPersistedVerificationResult } from '../verification/verification-result.persistence';
+import { AnalyticsService } from '../analytics/analytics.service';
 
 export interface ClaimExportRow {
   id: string;
@@ -45,6 +43,7 @@ export interface ClaimExportRow {
   updatedAt: Date;
   cancelledAt: Date | null;
   cancelledBy: string | null;
+  cancelReasonCode: string | null;
   cancelReason: string | null;
   reissuedFromId: string | null;
   tokenAddress: string | null;
@@ -65,6 +64,7 @@ interface RawClaimExportRow {
   deletedAt: Date | null;
   cancelledAt: Date | null;
   cancelledBy: string | null;
+  cancelReasonCode: CancelReasonCode | null;
   cancelReason: string | null;
   reissuedFromId: string | null;
   metadata: unknown;
@@ -112,9 +112,21 @@ export class ClaimsService {
     private readonly budgetService: BudgetService,
     private readonly sorobanTransactionService: SorobanTransactionLifecycleService,
     private readonly sorobanTransactionScheduler: SorobanTransactionScheduler,
+    private readonly verificationService: VerificationService,
+    @Optional() private readonly analyticsService?: AnalyticsService,
   ) {
     this.onchainEnabled =
       this.configService.get<string>('ONCHAIN_ENABLED') === 'true';
+  }
+
+  private async invalidateDashboardSummary(reason: string) {
+    try {
+      await this.analyticsService?.invalidateCache(reason);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to invalidate dashboard summary cache after ${reason}: ${String(error)}`,
+      );
+    }
   }
 
   async create(createClaimDto: CreateClaimDto) {
@@ -122,33 +134,54 @@ export class ClaimsService {
       where: { id: createClaimDto.campaignId },
     });
     if (!campaign) {
-      throw new NotFoundException('Campaign not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Campaign not found');
     }
 
-    await this.budgetService.assertWithinBudget(
-      createClaimDto.campaignId,
-      createClaimDto.amount,
-    );
+    // Budget enforcement + claim creation + the ledger entry that records
+    // the new lock all happen inside one transaction. reserveBudget() takes
+    // a row lock on the campaign first, so two concurrent creates against
+    // the same campaign are serialized here rather than racing on a
+    // read-then-write: the second transaction blocks until the first
+    // commits its `lock` ledger entry, and only then re-sums usage.
+    const claim = await this.prisma.$transaction(async tx => {
+      await this.budgetService.reserveBudget(
+        tx,
+        createClaimDto.campaignId,
+        createClaimDto.amount,
+      );
 
-    const claim = await this.prisma.claim.create({
-      data: {
-        campaignId: createClaimDto.campaignId,
-        amount: createClaimDto.amount,
-        recipientRef: this.encryptionService.encrypt(
-          createClaimDto.recipientRef,
-        ),
-        evidenceRef: createClaimDto.evidenceRef,
-        importJobId: createClaimDto.importJobId,
-        importRowNumber: createClaimDto.importRowNumber,
-        expiresAt:
-          createClaimDto.expiresAt ??
-          new Date(
-            Date.now() + DEFAULT_CLAIM_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+      const created = await tx.claim.create({
+        data: {
+          campaignId: createClaimDto.campaignId,
+          amount: createClaimDto.amount,
+          recipientRef: this.encryptionService.encrypt(
+            createClaimDto.recipientRef,
           ),
-      },
-      include: {
-        campaign: true,
-      },
+          evidenceRef: createClaimDto.evidenceRef,
+          importJobId: createClaimDto.importJobId,
+          importRowNumber: createClaimDto.importRowNumber,
+          expiresAt:
+            createClaimDto.expiresAt ??
+            new Date(
+              Date.now() + DEFAULT_CLAIM_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+            ),
+        },
+        include: {
+          campaign: true,
+        },
+      });
+
+      await tx.balanceLedger.create({
+        data: {
+          campaignId: createClaimDto.campaignId,
+          claimId: created.id,
+          eventType: 'lock',
+          amount: created.amount,
+          note: `Claim ${created.id} created; locked against campaign budget`,
+        },
+      });
+
+      return created;
     });
 
     claim.recipientRef = this.encryptionService.decrypt(claim.recipientRef);
@@ -161,7 +194,28 @@ export class ClaimsService {
     this.metricsService.incrementClaimsCreated(campaign.id);
     this.metricsService.adjustClaimsInFunnel('requested', 1);
 
+    await this.enqueueVerificationForClaim(claim.id);
+    await this.invalidateDashboardSummary('claim_updated');
+
     return claim;
+  }
+
+  /**
+   * Hand a freshly created claim to the AI verification pipeline.
+   *
+   * The claim is already durable by the time this runs, so a queue outage must
+   * not fail the request: the claim stays in `requested` without a
+   * verification record, which is exactly the state reconciliation reports on.
+   */
+  private async enqueueVerificationForClaim(claimId: string): Promise<void> {
+    try {
+      await this.verificationService.enqueueVerification(claimId);
+    } catch (error) {
+      this.loggerService.error(
+        `Failed to enqueue verification for claim ${claimId}`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   async findAll() {
@@ -174,6 +228,7 @@ export class ClaimsService {
     return claims.map(claim => ({
       ...claim,
       recipientRef: this.encryptionService.decrypt(claim.recipientRef),
+      verification: readPersistedVerificationResult(claim.anchorMetadata),
     }));
   }
 
@@ -186,15 +241,53 @@ export class ClaimsService {
     });
     const claim = claimResult;
     if (!claim || claim.deletedAt) {
-      throw new NotFoundException('Claim not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Claim not found');
     }
     return {
       ...claim,
       recipientRef: this.encryptionService.decrypt(claim.recipientRef),
+      verification: readPersistedVerificationResult(claim.anchorMetadata),
     };
   }
 
+  /**
+   * Transition a claim to `verified`.
+   *
+   * This is no longer a standalone status flip. The verification pipeline
+   * writes its outcome onto the claim, and this method only applies that
+   * outcome, so a claim with no completed verification record - or one whose
+   * score did not clear the threshold - cannot be marked verified.
+   */
   async verify(id: string) {
+    const claim = await this.prisma.claim.findUnique({ where: { id } });
+    if (!claim) {
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Claim not found');
+    }
+
+    const verification = readPersistedVerificationResult(claim.anchorMetadata);
+
+    if (!verification) {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        `Claim ${id} has no completed verification record. Verification is queued automatically when a claim is created; wait for it to complete before verifying.`,
+      );
+    }
+
+    if (!verification.passed) {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        `Claim ${id} did not pass verification (score ${verification.score} below threshold ${verification.threshold}) and cannot be marked verified.`,
+      );
+    }
+
+    if (claim.status === ClaimStatus.verified) {
+      // The pipeline already applied the same outcome - keep the call
+      // idempotent instead of failing on a no-op transition.
+      return this.findOne(id);
+    }
+
     return this.transitionStatus(
       id,
       ClaimStatus.requested,
@@ -210,18 +303,31 @@ export class ClaimsService {
     );
   }
 
-  async disburse(id: string, receiptPointer?: string) {
+  /**
+   * Mark a claim as disbursed and, when on-chain execution is enabled, create
+   * the Soroban transaction that performs the transfer.
+   *
+   * `correlationId` is the trace ID of the request (or job) driving the
+   * disbursement. It is stored on the Soroban transaction record and on the
+   * queue job so every later log line, retry and correlated on-chain event can
+   * be traced back to the originating request. When it is not supplied the
+   * ambient correlation ID is used, falling back to a per-claim ID so that
+   * background callers still produce a traceable reference.
+   */
+  async disburse(id: string, receiptPointer?: string, correlationId?: string) {
     const claim = await this.prisma.claim.findUnique({
       where: { id },
       include: { campaign: true },
     });
 
     if (!claim) {
-      throw new NotFoundException('Claim not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Claim not found');
     }
 
     if (claim.status !== ClaimStatus.approved) {
-      throw new BadRequestException(
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
         `Cannot transition from ${claim.status} to ${ClaimStatus.disbursed}`,
       );
     }
@@ -233,12 +339,16 @@ export class ClaimsService {
       });
     }
 
+    const traceId =
+      correlationId?.trim() ||
+      this.loggerService.getCorrelationId() ||
+      `disburse-${id}-${Date.now()}`;
+
     let sorobanTransaction: SorobanTransaction | undefined;
     if (this.onchainEnabled && this.onchainAdapter) {
       try {
         const packageId = await this.getPackageIdForClaim(id);
         const tokenAddress = this.getTokenAddressForClaim(claim);
-        const correlationId = `disburse-${id}-${Date.now()}`;
 
         sorobanTransaction =
           await this.sorobanTransactionService.createTransaction({
@@ -251,7 +361,7 @@ export class ClaimsService {
             ),
             amount: claim.amount.toString(),
             tokenAddress,
-            correlationId,
+            correlationId: traceId,
             metadata: {
               campaignId: claim.campaignId,
               claimAmount: claim.amount,
@@ -264,18 +374,19 @@ export class ClaimsService {
         await this.sorobanTransactionScheduler.scheduleTransaction(
           sorobanTransaction.id,
           {
-            correlationId,
+            correlationId: traceId,
             priority: 1,
           },
         );
 
-        this.logger.log(
+        this.loggerService.log(
           'Created Soroban transaction with lifecycle tracking for claim disbursement',
+          'ClaimsService',
           {
             claimId: id,
             transactionId: sorobanTransaction.id,
             packageId,
-            correlationId,
+            correlationId: traceId,
             receiptPointer,
           },
         );
@@ -287,7 +398,13 @@ export class ClaimsService {
       } catch (error) {
         this.loggerService.error(
           `Failed to create or schedule Soroban transaction for claim ${id}`,
-          error instanceof Error ? error.message : String(error),
+          error instanceof Error ? error.stack : undefined,
+          'ClaimsService',
+          {
+            claimId: id,
+            correlationId: traceId,
+            error: error instanceof Error ? error.message : String(error),
+          },
         );
       }
     }
@@ -298,15 +415,18 @@ export class ClaimsService {
       ClaimStatus.disbursed,
     );
 
-    this.logger.log(
+    this.loggerService.log(
       `Claim ${id} marked as disbursed with Soroban transaction tracking`,
+      'ClaimsService',
       {
         claimId: id,
         sorobanTransactionId: sorobanTransaction?.id,
+        correlationId: traceId,
         receiptPointer,
       },
     );
 
+    await this.invalidateDashboardSummary('claim_updated');
     return updatedClaim;
   }
 
@@ -501,10 +621,12 @@ export class ClaimsService {
   ) {
     const claim = await this.prisma.claim.findUnique({ where: { id } });
     if (!claim) {
-      throw new NotFoundException('Claim not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Claim not found');
     }
     if (claim.status !== fromStatus) {
-      throw new BadRequestException(
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
         `Cannot transition from ${claim.status} to ${toStatus}`,
       );
     }
@@ -553,6 +675,7 @@ export class ClaimsService {
     this.metricsService.adjustClaimsInFunnel(fromStatus, -1);
     this.metricsService.adjustClaimsInFunnel(toStatus, 1);
 
+    await this.invalidateDashboardSummary('claim_updated');
     return updatedClaim;
   }
 
@@ -610,7 +733,7 @@ export class ClaimsService {
       };
     }
 
-    throw new NotFoundException('Claim not found');
+    throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Claim not found');
   }
 
   private async findDisbursementTransaction(
@@ -638,7 +761,7 @@ export class ClaimsService {
     const claim = await this.resolveClaimByIdentifier(identifier);
 
     if (!claim) {
-      throw new NotFoundException('Claim not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Claim not found');
     }
 
     const tokenAddress = this.getTokenAddressForClaim(claim);
@@ -685,6 +808,124 @@ export class ClaimsService {
           explorerUrl: txHash ? explorerTxUrl(txHash, network) : undefined,
         };
       });
+  }
+
+  /**
+   * Retrieve the complete status transition history for a claim.
+   *
+   * Returns all status changes from oldest to newest, including:
+   * - Previous and new status for each transition
+   * - Timestamp of each transition
+   * - Actor ID and trigger type where available from audit metadata
+   * - Additional metadata (reason, verification score, etc.) as applicable
+   *
+   * Uses AuditLog records which are created whenever a claim status changes.
+   * If a claim was created before this feature was implemented, the history
+   * starts from the first recorded transition.
+   */
+  async getStatusHistory(claimId: string): Promise<{
+    claimId: string;
+    history: Array<{
+      previousStatus?: string;
+      newStatus: string;
+      timestamp: string;
+      actor?: string;
+      trigger?: string;
+      metadata?: Record<string, unknown>;
+    }>;
+    historicalCoverageStart: string;
+    historicalCoverageNote?: string;
+  }> {
+    const claim = await this.prisma.claim.findUnique({
+      where: { id: claimId },
+      include: { campaign: true },
+    });
+
+    if (!claim || claim.deletedAt) {
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Claim not found');
+    }
+
+    // Query all status change audit logs for this claim, ordered chronologically
+    const auditLogs = await this.prisma.auditLog.findMany({
+      where: {
+        entityId: claimId,
+        entity: 'claim',
+        action: {
+          startsWith: 'status_changed_to_',
+        },
+      },
+      orderBy: { timestamp: 'asc' },
+    });
+
+    // Transform audit logs into status history entries
+    const history = auditLogs.map(log => {
+      const metadata = log.metadata as Record<string, unknown> | null;
+      const previousStatus = metadata?.from as string | undefined;
+      const newStatus = log.action.replace('status_changed_to_', '');
+
+      // Extract actor and trigger from metadata
+      let actor: string | undefined;
+      let trigger: string | undefined;
+
+      // Determine actor and trigger type based on metadata patterns
+      if (metadata?.onchainResult) {
+        // Disbursement with on-chain result
+        actor = 'system';
+        trigger = 'on_chain_disbursement';
+      } else {
+        // Manual transition — actor is recorded in metadata if available
+        actor = metadata?.actorId as string | undefined;
+        // Infer trigger from status transition
+        if (previousStatus === 'requested' && newStatus === 'verified') {
+          trigger = 'manual_verification';
+        } else if (previousStatus === 'verified' && newStatus === 'approved') {
+          trigger = 'manual_approval';
+        } else if (previousStatus === 'approved' && newStatus === 'disbursed') {
+          trigger = 'manual_disbursement';
+        } else if (newStatus === 'cancelled') {
+          trigger = 'manual_cancellation';
+        } else if (newStatus === 'archived') {
+          trigger = 'manual_archive';
+        } else {
+          trigger = 'status_change';
+        }
+      }
+
+      return {
+        previousStatus,
+        newStatus,
+        timestamp: log.timestamp.toISOString(),
+        actor,
+        trigger,
+        metadata: {
+          // Preserve operational metadata but exclude internal fields
+          ...(metadata?.from ? { from: metadata.from } : {}),
+          ...(metadata?.to ? { to: metadata.to } : {}),
+          ...(metadata?.reason ? { cancelReason: metadata.reason } : {}),
+          ...(metadata?.code ? { cancelReasonCode: metadata.code } : {}),
+          ...(metadata?.verificationScore
+            ? { verificationScore: metadata.verificationScore }
+            : {}),
+        },
+      };
+    });
+
+    // Determine historical coverage
+    let historicalCoverageNote: string | undefined;
+    if (history.length === 0) {
+      historicalCoverageNote =
+        'No status transitions recorded. Claim may have been created before status history tracking was implemented.';
+    } else if (auditLogs[0].timestamp.getTime() > claim.createdAt.getTime()) {
+      historicalCoverageNote =
+        'Incomplete history. Status history begins from the first recorded transition and may not include claim creation or early transitions.';
+    }
+
+    return {
+      claimId,
+      history,
+      historicalCoverageStart: claim.createdAt.toISOString(),
+      historicalCoverageNote,
+    };
   }
 
   async shareReceipt(
@@ -814,7 +1055,7 @@ export class ClaimsService {
   private static readonly EXPORT_BATCH_SIZE = 500;
 
   private static readonly CSV_HEADER =
-    'id,campaignId,campaignName,status,amount,evidenceRef,createdAt,updatedAt,cancelledAt,cancelledBy,cancelReason,reissuedFromId,tokenAddress';
+    'id,campaignId,campaignName,status,amount,evidenceRef,createdAt,updatedAt,cancelledAt,cancelledBy,cancelReasonCode,cancelReason,reissuedFromId,tokenAddress';
 
   private buildExportWhere(
     query: ExportClaimsQueryDto,
@@ -828,10 +1069,18 @@ export class ClaimsService {
 
     if (query.from || query.to) {
       if (query.from && isNaN(Date.parse(query.from))) {
-        throw new BadRequestException(`Invalid 'from' date: ${query.from}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'from' date: ${query.from}`,
+        );
       }
       if (query.to && isNaN(Date.parse(query.to))) {
-        throw new BadRequestException(`Invalid 'to' date: ${query.to}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'to' date: ${query.to}`,
+        );
       }
       where.createdAt = {};
       if (query.from) where.createdAt.gte = new Date(query.from);
@@ -871,6 +1120,7 @@ export class ClaimsService {
       updatedAt: c.updatedAt,
       cancelledAt: c.cancelledAt ?? null,
       cancelledBy: c.cancelledBy ?? null,
+      cancelReasonCode: c.cancelReasonCode ?? null,
       cancelReason: c.cancelReason ?? null,
       reissuedFromId: c.reissuedFromId ?? null,
       tokenAddress: (claimMetadata?.tokenAddress ??
@@ -918,6 +1168,7 @@ export class ClaimsService {
         escapeCsvField(row.updatedAt.toISOString()),
         escapeCsvField(row.cancelledAt?.toISOString() ?? ''),
         escapeCsvField(row.cancelledBy),
+        escapeCsvField(row.cancelReasonCode),
         escapeCsvField(row.cancelReason),
         escapeCsvField(row.reissuedFromId),
         escapeCsvField(row.tokenAddress),

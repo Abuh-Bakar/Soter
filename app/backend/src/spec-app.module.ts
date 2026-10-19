@@ -6,7 +6,7 @@
  * Linting is disabled because this module contains many stub providers and
  * imports that are necessary for metadata collection but not for actual runtime use.
  */
-import { Module } from '@nestjs/common';
+import {        Module        } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 
 import { AppController } from '../src/app.controller';
@@ -36,6 +36,7 @@ import { ClaimsController } from '../src/claims/claims.controller';
 import { ClaimsService } from '../src/claims/claims.service';
 import { InternalNotesService } from '../src/common/services/internal-notes.service';
 import { SorobanEventCorrelationService } from '../src/onchain/soroban-event-correlation.service';
+import { SorobanCorrelationTraceService } from '../src/onchain/soroban-correlation-trace.service';
 
 import { DeploymentMetadataController } from '../src/deployment-metadata/deployment-metadata.controller';
 import { DeploymentMetadataService } from '../src/deployment-metadata/deployment-metadata.service';
@@ -54,6 +55,8 @@ import { EvidenceService } from '../src/evidence/evidence.service';
 import { ArtifactOwnershipTokenService } from '../src/evidence/artifact-ownership-token.service';
 import { UploadSessionController } from '../src/evidence/upload-session.controller';
 import { UploadSessionService } from '../src/evidence/upload-session.service';
+import { OrphanedArtifactsController } from '../src/evidence/orphaned-artifacts.controller';
+import { OrphanedArtifactsService } from '../src/evidence/orphaned-artifacts.service';
 
 import { HealthController } from '../src/health/health.controller';
 import { HealthService } from '../src/health/health.service';
@@ -79,6 +82,8 @@ import { AidEscrowService } from '../src/onchain/aid-escrow.service';
 import { LedgerAdminController } from '../src/onchain/ledger-admin.controller';
 import { LedgerBackfillService } from '../src/onchain/ledger-backfill.service';
 import { LedgerReconciliationService } from '../src/onchain/ledger-reconciliation.service';
+import { AdminTransferController } from '../src/onchain/admin-transfer.controller';
+import { AdminTransferService } from '../src/onchain/admin-transfer.service';
 
 import { InvitesController } from '../src/orgs/invites.controller';
 import { InvitesService } from '../src/orgs/invites.service';
@@ -100,6 +105,8 @@ import { SandboxService } from '../src/sandbox/sandbox.service';
 
 import { AdminSearchController } from '../src/search/admin-search.controller';
 import { AdminSearchService } from '../src/search/admin-search.service';
+import { SearchIndexController } from '../src/search/search-index.controller';
+import { SearchIndexService } from '../src/search/search-index.service';
 
 import { SessionController } from '../src/session/session.controller';
 import { SessionService } from '../src/session/session.service';
@@ -141,6 +148,7 @@ const stub = <T>(value: T) => ({ useValue: value });
     EntityLinkingController,
     EvidenceController,
     UploadSessionController,
+    OrphanedArtifactsController,
     HealthController,
     JobsController,
     JobStatusStreamingController,
@@ -151,6 +159,7 @@ const stub = <T>(value: T) => ({ useValue: value });
     MetricsController,
     AidEscrowController,
     LedgerAdminController,
+    AdminTransferController,
     InvitesController,
     RecipientImportController,
     RecipientsController,
@@ -158,6 +167,7 @@ const stub = <T>(value: T) => ({ useValue: value });
     RetentionPolicyController,
     SandboxController,
     AdminSearchController,
+    SearchIndexController,
     SessionController,
     TestErrorController,
     VerificationController,
@@ -178,6 +188,7 @@ const stub = <T>(value: T) => ({ useValue: value });
     { provide: ClaimsService, ...stub({}) },
     { provide: InternalNotesService, ...stub({}) },
     { provide: SorobanEventCorrelationService, ...stub({}) },
+    { provide: SorobanCorrelationTraceService, ...stub({}) },
     { provide: DeploymentMetadataService, ...stub({}) },
     { provide: DeviceTokensService, ...stub({}) },
     { provide: DriftReportService, ...stub({}) },
@@ -185,6 +196,7 @@ const stub = <T>(value: T) => ({ useValue: value });
     { provide: EvidenceService, ...stub({}) },
     { provide: ArtifactOwnershipTokenService, ...stub({}) },
     { provide: UploadSessionService, ...stub({}) },
+    { provide: OrphanedArtifactsService, ...stub({}) },
     { provide: HealthService, ...stub({}) },
     { provide: MetadataService, ...stub({}) },
     { provide: DlqService, ...stub({}) },
@@ -195,12 +207,14 @@ const stub = <T>(value: T) => ({ useValue: value });
     { provide: AidEscrowService, ...stub({}) },
     { provide: LedgerBackfillService, ...stub({}) },
     { provide: LedgerReconciliationService, ...stub({}) },
+    { provide: AdminTransferService, ...stub({}) },
     { provide: InvitesService, ...stub({}) },
     { provide: RecipientImportService, ...stub({}) },
     { provide: RecipientsService, ...stub({}) },
     { provide: RetentionPolicyService, ...stub({}) },
     { provide: SandboxService, ...stub({}) },
     { provide: AdminSearchService, ...stub({}) },
+    { provide: SearchIndexService, ...stub({}) },
     { provide: SessionService, ...stub({}) },
     { provide: VerificationService, ...stub({}) },
     { provide: VerificationFlowService, ...stub({}) },

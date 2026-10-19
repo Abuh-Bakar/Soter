@@ -1,11 +1,23 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AidDetails, fetchAidDetails, submitClaim } from './aidApi';
+import {
+  isRateLimitedError,
+  parseRetryAfterMs,
+  RateLimitedError,
+} from './requestLayer';
 
 import { config } from '../config';
+import { buildCorrelationHeaders, structuredLogger } from './logger';
+import { sha256, toHex } from './sha256';
+import {
+  beginBackgroundWork,
+  endBackgroundWork,
+} from './backgroundTaskManager';
 
 const API_URL = config.apiUrl;
 
 const SYNC_QUEUE_STORAGE_KEY = '@soter/sync-queue';
+const SYNC_LOG_SCOPE = 'sync';
 const DEFAULT_MAX_RETRIES = 5;
 const BASE_RETRY_DELAY_MS = 30_000;
 const MAX_RETRY_DELAY_MS = 15 * 60 * 1000;
@@ -47,6 +59,16 @@ export interface EvidenceUploadPayload {
   estimatedSize?: number;
 }
 
+/**
+ * The platform's WebCrypto `subtle` implementation, when one exists.
+ *
+ * React Native does not provide it: `react-native-get-random-values`
+ * polyfills `getRandomValues` only, and Metro's `crypto` shim has no
+ * `webcrypto`. Both lookups are therefore guarded, and `sha256Hex` falls
+ * back to the pure-JS digest in `./sha256` — without it, every evidence
+ * chunk upload throws `WebCrypto subtle is not available` on a real device
+ * (release build) and the sync queue can never drain.
+ */
 const getSubtleCrypto = () => {
   if (typeof crypto !== 'undefined' && crypto.subtle) {
     return crypto.subtle;
@@ -101,14 +123,39 @@ export function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+const BASE64_ALPHABET =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/** Standard (padded) base64 encoding of a byte array. */
+export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  const groups: string[] = [];
+
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const has1 = i + 1 < bytes.length;
+    const has2 = i + 2 < bytes.length;
+    const b1 = has1 ? bytes[i + 1] : 0;
+    const b2 = has2 ? bytes[i + 2] : 0;
+
+    groups.push(
+      BASE64_ALPHABET[b0 >> 2] +
+        BASE64_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] +
+        (has1 ? BASE64_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=') +
+        (has2 ? BASE64_ALPHABET[b2 & 0x3f] : '='),
+    );
+  }
+
+  return groups.join('');
+}
+
 export async function sha256Hex(data: Uint8Array): Promise<string> {
   const subtle = getSubtleCrypto();
-  if (!subtle) {
-    throw new Error('WebCrypto subtle is not available');
+  if (subtle) {
+    const hashBuffer = await subtle.digest('SHA-256', data);
+    return toHex(new Uint8Array(hashBuffer));
   }
-  const hashBuffer = await subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+  // Device fallback: no `crypto.subtle` in a React Native release bundle.
+  return toHex(sha256(data));
 }
 
 export interface ClaimSubmissionPayload {
@@ -137,6 +184,11 @@ export interface QueuedSyncAction<TPayload = SyncActionPayload> {
   lastError: string | null;
   deferralReason?: DeferralReason;
   deferralLog?: string[];
+  /** Consecutive HTTP 429 responses for this action; drives extended rate-limit backoff. */
+  rateLimitCount?: number;
+  /** Correlation id generated at enqueue time; joins app log lines and
+   *  backend request logs for every attempt of this sync item. */
+  correlationId?: string;
 }
 
 export interface SyncQueueState {
@@ -213,8 +265,55 @@ const persistQueue = async () => {
 
 const makeActionId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
+/** Correlation ids follow the existing `mobile-<ts>-<hex>` convention so
+ *  they are trivially distinguishable in backend request logs. */
+const makeCorrelationId = () => `sync-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
+
+const logSync = (
+  level: 'debug' | 'info' | 'warn' | 'error',
+  message: string,
+  action: Pick<QueuedSyncAction, 'correlationId'>,
+  data?: Record<string, unknown>,
+): void => {
+  structuredLogger[level](message, { correlationId: action.correlationId, ...data }, SYNC_LOG_SCOPE);
+};
+
 const backoffDelayMs = (retryCount: number) =>
   Math.min(BASE_RETRY_DELAY_MS * 2 ** retryCount, MAX_RETRY_DELAY_MS);
+
+/**
+ * Rate-limit backoff for the sync queue.
+ *
+ * - Honours `Retry-After` when the server sends one.
+ * - On repeated 429s, extends the delay via a streak floor so a short
+ *   Retry-After cannot reset the schedule back to the default.
+ * - Independent of battery/metered deferral (those only gate *when* flush
+ *   considers an item; this only sets `nextRetryAt`).
+ */
+export const computeRateLimitBackoffMs = (
+  consecutiveRateLimits: number,
+  retryAfterMs: number | null,
+  options?: { saverMode?: boolean },
+): number => {
+  const streak = Math.max(1, consecutiveRateLimits);
+  const streakFloor = Math.min(BASE_RETRY_DELAY_MS * 2 ** streak, MAX_RETRY_DELAY_MS);
+
+  let delay: number;
+  if (retryAfterMs != null && retryAfterMs >= 0) {
+    // First 429: respect Retry-After as-is. Repeated 429s: never shrink below streak floor.
+    delay = streak > 1 ? Math.max(retryAfterMs, streakFloor) : retryAfterMs;
+  } else {
+    delay = streakFloor;
+  }
+
+  if (options?.saverMode) {
+    delay *= SAVER_BACKOFF_MULTIPLIER;
+  }
+
+  return Math.min(Math.max(delay, 0), MAX_RETRY_DELAY_MS);
+};
+
+export { parseRetryAfterMs, RateLimitedError, isRateLimitedError };
 
 const toErrorMessage = (error: unknown) => {
   if (error instanceof Error) {
@@ -222,6 +321,24 @@ const toErrorMessage = (error: unknown) => {
   }
 
   return 'Unexpected sync failure';
+};
+
+/** Throw RateLimitedError (with Retry-After) on 429; otherwise a generic HTTP error. */
+const throwHttpError = (response: Response, prefix?: string): never => {
+  if (response.status === 429) {
+    const retryAfterMs = parseRetryAfterMs(
+      typeof response.headers?.get === 'function'
+        ? response.headers.get('Retry-After')
+        : null,
+    );
+    const message = prefix
+      ? `${prefix}: HTTP error! status: 429`
+      : 'HTTP error! status: 429';
+    throw new RateLimitedError(retryAfterMs, message);
+  }
+
+  const statusMsg = `HTTP error! status: ${response.status}`;
+  throw new Error(prefix ? `${prefix}: ${statusMsg}` : statusMsg);
 };
 
 export const isConflictError = (error: unknown): boolean => {
@@ -355,7 +472,7 @@ const logDeferral = (action: QueuedSyncAction, reason: DeferralReason, details: 
   return logEntry;
 };
 
-const enqueue = async (request: SyncActionRequest) => {
+const enqueue = async (request: SyncActionRequest, options?: { correlationId?: string }) => {
   await hydrateQueue();
 
   // Idempotency: if a claim-submission with the same key is already queued
@@ -384,24 +501,27 @@ const enqueue = async (request: SyncActionRequest) => {
     createdAt: now,
     updatedAt: now,
     lastError: null,
+    correlationId: options?.correlationId ?? makeCorrelationId(),
   };
 
   await replaceQueueItems([...queueState.items, action]);
+  logSync('info', 'sync.queue.enqueued', action, { actionType: action.type, actionId: action.id });
   return action;
 };
 
 const runAction = async (action: QueuedSyncAction) => {
   switch (action.type) {
     case 'status-refresh':
-      return fetchAidDetails((action.payload as StatusRefreshPayload).aidId);
+      return fetchAidDetails((action.payload as StatusRefreshPayload).aidId, action.correlationId);
     case 'claim-confirmation': {
       const { claimId } = action.payload as ClaimConfirmationPayload;
       const response = await fetch(`${API_URL}/claims/${claimId}/verify`, {
         method: 'POST',
+        headers: buildCorrelationHeaders(action.correlationId),
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throwHttpError(response);
       }
 
       return response.json();
@@ -426,120 +546,182 @@ const runAction = async (action: QueuedSyncAction) => {
       const fileBytes = base64ToUint8Array(requestData.imageBase64);
       const chunkSize = 512 * 1024; // 512 KB chunks
 
-      if (!payload.sessionId) {
-        const createSessionRes = await fetch(`${API_URL}/evidence/upload-sessions`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            fileName: requestData.filename,
-            mimeType: requestData.contentType,
-            totalSize: fileBytes.length,
-            chunkSize,
-          }),
-        });
+      /**
+       * iOS background-task expiration handling (#1364).
+       *
+       * `beginBackgroundWork` registers a time-bounded background-task token
+       * with the OS and starts a safety-margin timer.  When the OS expires the
+       * budget (or the timer fires first) the `onExpire` callback is invoked,
+       * which persists the current chunk progress to AsyncStorage so the next
+       * foreground or background opportunity can resume from the last
+       * successfully uploaded chunk rather than restarting from scratch.
+       */
+      const bgHandle = beginBackgroundWork(
+        `evidence-upload:${action.id}`,
+        async (_taskName: string) => {
+          // Checkpoint: persist the upload state accumulated so far.
+          // `payload` is mutated in-place as chunks succeed, so whatever
+          // progress has been made is already reflected here.
+          logSync('warn', 'sync.evidenceUpload.backgroundExpired', action, {
+            actionId: action.id,
+            sessionId: payload.sessionId,
+            uploadedChunks: payload.uploadedChunks?.length ?? 0,
+            totalChunks: payload.totalChunks ?? 0,
+          });
+          await persistQueue();
+        },
+      );
 
-        if (!createSessionRes.ok) {
-          let errorMsg = `HTTP error ${createSessionRes.status}`;
-          try {
-            const errData = await createSessionRes.json();
-            if (errData?.message) errorMsg = errData.message;
-          } catch {}
-          throw new Error(`Failed to create upload session: ${errorMsg}`);
-        }
+      try {
+        if (!payload.sessionId) {
+          const createSessionRes = await fetch(`${API_URL}/evidence/upload-sessions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...buildCorrelationHeaders(action.correlationId),
+            },
+            body: JSON.stringify({
+              fileName: requestData.filename,
+              mimeType: requestData.contentType,
+              totalSize: fileBytes.length,
+              chunkSize,
+            }),
+          });
 
-        const session = await createSessionRes.json();
-        payload.sessionId = session.id;
-        payload.totalChunks = session.totalChunks;
-        payload.uploadedChunks = [];
-        payload.progress = 0;
-        await persistQueue();
-        emitQueueState();
-      } else {
-        const statusRes = await fetch(`${API_URL}/evidence/upload-sessions/${payload.sessionId}/status`);
-        if (statusRes.status === 404) {
-          payload.sessionId = undefined;
-          payload.uploadedChunks = undefined;
-          payload.totalChunks = undefined;
+          if (!createSessionRes.ok) {
+            let errorMsg = `HTTP error ${createSessionRes.status}`;
+            try {
+              const errData = await createSessionRes.json();
+              if (errData?.message) errorMsg = errData.message;
+            } catch {}
+            if (createSessionRes.status === 429) {
+              throwHttpError(createSessionRes, 'Failed to create upload session');
+            }
+            throw new Error(`Failed to create upload session: ${errorMsg}`);
+          }
+
+          const session = await createSessionRes.json();
+          payload.sessionId = session.id;
+          payload.totalChunks = session.totalChunks;
+          payload.uploadedChunks = [];
           payload.progress = 0;
           await persistQueue();
           emitQueueState();
-          return runAction(action);
+        } else {
+          const statusRes = await fetch(`${API_URL}/evidence/upload-sessions/${payload.sessionId}/status`, {
+            headers: buildCorrelationHeaders(action.correlationId),
+          });
+          if (statusRes.status === 404) {
+            payload.sessionId = undefined;
+            payload.uploadedChunks = undefined;
+            payload.totalChunks = undefined;
+            payload.progress = 0;
+            await persistQueue();
+            emitQueueState();
+            endBackgroundWork(bgHandle);
+            return runAction(action);
+          }
+          if (!statusRes.ok) {
+            throwHttpError(statusRes, 'Failed to query session status');
+          }
+          const statusData = await statusRes.json();
+          payload.uploadedChunks = statusData.receivedChunks || [];
+          payload.totalChunks = statusData.totalChunks;
+          payload.progress = payload.totalChunks ? payload.uploadedChunks.length / payload.totalChunks : 0;
+          await persistQueue();
+          emitQueueState();
         }
-        if (!statusRes.ok) {
-          throw new Error(`Failed to query session status: ${statusRes.status}`);
+
+        const totalChunks = payload.totalChunks || 0;
+        const uploadedChunks = payload.uploadedChunks || [];
+
+        for (let index = 0; index < totalChunks; index++) {
+          if (uploadedChunks.includes(index)) {
+            continue;
+          }
+
+          const start = index * chunkSize;
+          const end = Math.min(start + chunkSize, fileBytes.length);
+          const chunkBytes = fileBytes.subarray(start, end);
+
+          const checksum = await sha256Hex(chunkBytes);
+
+          // The chunk is attached as a `data:` URI file part rather than a
+          // `Blob`. React Native's Blob cannot be built from bytes — its
+          // `createFromParts` throws "Creating blobs from 'ArrayBuffer' and
+          // 'ArrayBufferView' are not supported" — so `new Blob([chunkBytes])`
+          // fails on device (it works under Jest, where Blob is Node's, which
+          // is why the unit tests and the CI harness never disagreed until the
+          // upload ran on an emulator). A `{ uri, name, type }` part is the
+          // form React Native's networking layer expects, and both platforms
+          // read its bytes from the `data:` URI (Android:
+          // `RequestBodyUtil.getFileInputStream` base64-decodes it; iOS:
+          // `processDataForHTTPQuery` loads it through `NSURLRequest`).
+          const formData = new FormData();
+          formData.append('chunk', {
+            uri: `data:application/octet-stream;base64,${uint8ArrayToBase64(chunkBytes)}`,
+            name: requestData.filename,
+            type: 'application/octet-stream',
+          } as unknown as Blob);
+          formData.append('index', index.toString());
+          formData.append('checksum', checksum);
+
+          const uploadChunkRes = await fetch(`${API_URL}/evidence/upload-sessions/${payload.sessionId}/chunks`, {
+            method: 'POST',
+            body: formData,
+            headers: buildCorrelationHeaders(action.correlationId),
+          });
+
+          if (!uploadChunkRes.ok) {
+            let errorMsg = `HTTP error ${uploadChunkRes.status}`;
+            try {
+              const errData = await uploadChunkRes.json();
+              if (errData?.message) errorMsg = errData.message;
+            } catch {}
+            if (uploadChunkRes.status === 429) {
+              throwHttpError(uploadChunkRes, `Chunk ${index} upload failed`);
+            }
+            throw new Error(`Chunk ${index} upload failed: ${errorMsg}`);
+          }
+
+          uploadedChunks.push(index);
+          payload.uploadedChunks = uploadedChunks;
+          payload.progress = uploadedChunks.length / totalChunks;
+          // Persist after each chunk so expiration always has an up-to-date checkpoint.
+          await persistQueue();
+          emitQueueState();
         }
-        const statusData = await statusRes.json();
-        payload.uploadedChunks = statusData.receivedChunks || [];
-        payload.totalChunks = statusData.totalChunks;
-        payload.progress = payload.totalChunks ? payload.uploadedChunks.length / payload.totalChunks : 0;
-        await persistQueue();
-        emitQueueState();
-      }
 
-      const totalChunks = payload.totalChunks || 0;
-      const uploadedChunks = payload.uploadedChunks || [];
-
-      for (let index = 0; index < totalChunks; index++) {
-        if (uploadedChunks.includes(index)) {
-          continue;
-        }
-
-        const start = index * chunkSize;
-        const end = Math.min(start + chunkSize, fileBytes.length);
-        const chunkBytes = fileBytes.subarray(start, end);
-
-        const checksum = await sha256Hex(chunkBytes);
-        const chunkBlob = new Blob([chunkBytes], { type: 'application/octet-stream' });
-
-        const formData = new FormData();
-        formData.append('chunk', chunkBlob, requestData.filename);
-        formData.append('index', index.toString());
-        formData.append('checksum', checksum);
-
-        const uploadChunkRes = await fetch(`${API_URL}/evidence/upload-sessions/${payload.sessionId}/chunks`, {
+        const finalizeRes = await fetch(`${API_URL}/evidence/upload-sessions/${payload.sessionId}/finalize`, {
           method: 'POST',
-          body: formData,
+          headers: {
+            'Content-Type': 'application/json',
+            ...buildCorrelationHeaders(action.correlationId),
+          },
         });
 
-        if (!uploadChunkRes.ok) {
-          let errorMsg = `HTTP error ${uploadChunkRes.status}`;
+        if (!finalizeRes.ok) {
+          let errorMsg = `HTTP error ${finalizeRes.status}`;
           try {
-            const errData = await uploadChunkRes.json();
+            const errData = await finalizeRes.json();
             if (errData?.message) errorMsg = errData.message;
           } catch {}
-          throw new Error(`Chunk ${index} upload failed: ${errorMsg}`);
+          if (finalizeRes.status === 429) {
+            throwHttpError(finalizeRes, 'Failed to finalize upload');
+          }
+          throw new Error(`Failed to finalize upload: ${errorMsg}`);
         }
 
-        uploadedChunks.push(index);
-        payload.uploadedChunks = uploadedChunks;
-        payload.progress = uploadedChunks.length / totalChunks;
-        await persistQueue();
-        emitQueueState();
+        return finalizeRes.json();
+      } finally {
+        // Always release the background-task token, whether the upload
+        // succeeded, threw, or was interrupted by the expiration handler.
+        endBackgroundWork(bgHandle);
       }
-
-      const finalizeRes = await fetch(`${API_URL}/evidence/upload-sessions/${payload.sessionId}/finalize`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (!finalizeRes.ok) {
-        let errorMsg = `HTTP error ${finalizeRes.status}`;
-        try {
-          const errData = await finalizeRes.json();
-          if (errData?.message) errorMsg = errData.message;
-        } catch {}
-        throw new Error(`Failed to finalize upload: ${errorMsg}`);
-      }
-
-      return finalizeRes.json();
     }
     case 'claim-submission': {
       const { claimId, idempotencyKey } = action.payload as ClaimSubmissionPayload;
-      return submitClaim(claimId, idempotencyKey);
+      return submitClaim(claimId, idempotencyKey, action.correlationId);
     }
     default:
       throw new Error(`Unsupported sync action type: ${String(action.type)}`);
@@ -591,11 +773,16 @@ export const dispatchNetworkAction = async <T extends SyncActionType>(
     createdAt: now,
     updatedAt: now,
     lastError: null,
+    correlationId: makeCorrelationId(),
   };
+
+  // Online path: the offline case returned above, so online is always true here.
+  logSync('info', 'sync.dispatch.started', previewAction, { actionType: previewAction.type, actionId: previewAction.id, online: true });
 
   try {
     const result = (await runAction(previewAction)) as SyncExecutionResultMap[T];
     const completedAt = new Date().toISOString();
+    logSync('info', 'sync.dispatch.completed', previewAction, { actionType: previewAction.type, actionId: previewAction.id });
     successSubscribers.forEach((listener) =>
       listener({ action: previewAction, completedAt, result }),
     );
@@ -605,6 +792,8 @@ export const dispatchNetworkAction = async <T extends SyncActionType>(
     });
     return { status: 'completed', result };
   } catch (error) {
+    logSync('warn', 'sync.dispatch.failed', previewAction, { actionType: previewAction.type, actionId: previewAction.id, error: toErrorMessage(error) });
+
     if (isConflictError(error)) {
       const now = new Date().toISOString();
       const conflictMessage = mapConflictErrorMessage(toErrorMessage(error));
@@ -619,6 +808,7 @@ export const dispatchNetworkAction = async <T extends SyncActionType>(
         createdAt: now,
         updatedAt: now,
         lastError: toErrorMessage(error),
+        correlationId: previewAction.correlationId,
       };
       await replaceQueueItems([...queueState.items, action]);
       setQueueState({
@@ -631,7 +821,9 @@ export const dispatchNetworkAction = async <T extends SyncActionType>(
       throw error;
     }
 
-    const action = await enqueue(request);
+    // Keep the preview attempt's correlation id so the failed attempt and
+    // all subsequent retries of the queued item share one correlation id.
+    const action = await enqueue(request, { correlationId: previewAction.correlationId });
     setQueueState({
       lastSyncError: toErrorMessage(error),
     });
@@ -723,6 +915,11 @@ export const flushPendingNetworkActions = async (options?: {
 
       if (shouldDefer) {
         deferredCount++;
+        logSync('info', 'sync.flush.deferred', action, {
+          actionType: action.type,
+          actionId: action.id,
+          reason: deferralReason,
+        });
         // Update action with deferral info
         items = items.map(item =>
           item.id === action.id
@@ -740,7 +937,13 @@ export const flushPendingNetworkActions = async (options?: {
       actionsProcessed++;
 
       try {
+        logSync('info', 'sync.flush.attempt', action, {
+          actionType: action.type,
+          actionId: action.id,
+          attempt: action.retryCount + 1,
+        });
         const result = await runAction(action);
+        logSync('info', 'sync.flush.completed', action, { actionType: action.type, actionId: action.id });
         if (action.type === 'claim-submission') {
           // Keep the item in the queue as 'submitted' for status display
           items = items.map((item) =>
@@ -768,6 +971,7 @@ export const flushPendingNetworkActions = async (options?: {
         );
       } catch (error) {
         const isConflict = isConflictError(error);
+        const rateLimited = isRateLimitedError(error);
         const retryCount = action.retryCount + 1;
         const nextState: SyncActionState = isConflict
           ? 'conflict'
@@ -775,8 +979,28 @@ export const flushPendingNetworkActions = async (options?: {
           ? 'failed'
           : 'retrying';
 
+        logSync(nextState === 'retrying' ? 'warn' : 'error', 'sync.flush.failed', action, {
+          actionType: action.type,
+          actionId: action.id,
+          attempt: retryCount,
+          nextState,
+          error: toErrorMessage(error),
+        });
+
         // In saver mode, use a longer backoff to reduce network usage
         const backoffMultiplier = isSaverMode ? SAVER_BACKOFF_MULTIPLIER : 1;
+
+        // Rate-limit backoff is distinct from battery/metered deferral:
+        // deferral only skips items during flush; this only advances nextRetryAt.
+        const rateLimitCount = rateLimited ? (action.rateLimitCount ?? 0) + 1 : 0;
+        const retryAfterMs =
+          error instanceof RateLimitedError ? error.retryAfterMs : null;
+
+        const delayMs = rateLimited
+          ? computeRateLimitBackoffMs(rateLimitCount, retryAfterMs, {
+              saverMode: isSaverMode,
+            })
+          : backoffDelayMs(retryCount) * backoffMultiplier;
 
         items = items.map((item) =>
           item.id === action.id
@@ -784,9 +1008,8 @@ export const flushPendingNetworkActions = async (options?: {
                 ...item,
                 state: nextState,
                 retryCount,
-                nextRetryAt: new Date(
-                  Date.now() + backoffDelayMs(retryCount) * backoffMultiplier,
-                ).toISOString(),
+                rateLimitCount,
+                nextRetryAt: new Date(Date.now() + delayMs).toISOString(),
                 updatedAt: new Date().toISOString(),
                 lastError: toErrorMessage(error),
               }
@@ -826,7 +1049,15 @@ export const requeueAction = async (actionId: string) => {
   const now = new Date().toISOString();
   const items = queueState.items.map((item) =>
     item.id === actionId
-      ? { ...item, state: 'pending' as SyncActionState, retryCount: 0, nextRetryAt: now, lastError: null, updatedAt: now }
+      ? {
+          ...item,
+          state: 'pending' as SyncActionState,
+          retryCount: 0,
+          rateLimitCount: 0,
+          nextRetryAt: now,
+          lastError: null,
+          updatedAt: now,
+        }
       : item,
   );
   await replaceQueueItems(items);

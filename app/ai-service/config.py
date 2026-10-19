@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import secrets
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import Field, HttpUrl, model_validator
 from pydantic_core import PydanticUndefined
@@ -30,6 +30,8 @@ _SECRET_FIELDS = frozenset(
     {
         "openai_api_key",
         "groq_api_key",
+        "openai_fallback_api_key",
+        "groq_fallback_api_key",
         "ai_webhook_secret",
         "artifact_signing_secret",
     }
@@ -45,6 +47,13 @@ _RATE_LIMIT_PATTERN: re.Pattern[str] = re.compile(
 
 _REDIS_SCHEMES = ("redis://", "rediss://", "unix://")
 
+DEFAULT_PROVIDER_CAPABILITY_MATRIX = {
+    "openai": ["llm"],
+    "groq": ["llm"],
+    "test": ["llm", "ocr"],
+    "tesseract": ["ocr"],
+}
+
 
 class Settings(BaseSettings):
     """
@@ -58,6 +67,7 @@ class Settings(BaseSettings):
         AI_DETERMINISTIC_MODE: Enable deterministic AI results for verification and classification during tests/CI
         TEST_PROVIDER_MODE: Enable test provider mode that returns fixture-driven results (no API keys required)
         LLM_TIMEOUT_SECONDS: Timeout for LLM API requests
+        PROVIDER_HTTP_IDLE_TIMEOUT_SECONDS: Idle period before pooled provider HTTP clients are recycled
         MAX_REQUEST_BODY_BYTES: Maximum request body size for AI endpoints
         MAX_REQUEST_TIMEOUT_SECONDS: Maximum caller-supplied provider timeout
         APP_ENV: Application environment (development, staging, production, test)
@@ -65,6 +75,7 @@ class Settings(BaseSettings):
         HOST: Server host (default: 0.0.0.0)
         PORT: Server port (default: 8000)
         REDIS_URL: Redis connection URL for task broker (default: redis://localhost:6379/0)
+        ASYNC_JOB_IDLE_TIMEOUT_SECONDS: Queued jobs not started by a worker within this window are marked timed out (default: 600)
         BACKEND_WEBHOOK_URL: Webhook URL to notify NestJS backend when tasks complete
         PROOF_OF_LIFE_CONFIDENCE_THRESHOLD: Default threshold for liveness verification
         PROOF_OF_LIFE_MIN_FACE_SIZE: Minimum detected face size in pixels
@@ -76,11 +87,20 @@ class Settings(BaseSettings):
     # API Keys
     openai_api_key: Optional[str] = None
     groq_api_key: Optional[str] = None
+    # Fallback API keys for key rotation (issue #1411).
+    # When the primary key fails with an authentication error (401), the
+    # provider will retry once using the fallback key, provided one is set.
+    # Fallback keys are optional; if not set or empty, no fallback retry occurs.
+    openai_fallback_api_key: Optional[str] = None
+    groq_fallback_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
     groq_model: str = "llama-3.3-70b-versatile"
     ai_deterministic_mode: bool = False
     test_provider_mode: bool = False
     llm_timeout_seconds: int = 30
+    # Recycle pooled provider HTTP clients before server/load-balancer idle
+    # timeouts can leave stale sockets behind.
+    provider_http_idle_timeout_seconds: float = 300.0
     humanitarian_primary_prompt_version: str = "v1"
     humanitarian_fallback_prompt_version: str = "v1"
 
@@ -99,6 +119,9 @@ class Settings(BaseSettings):
             "llama-3.3-70b-versatile": {"prompt": 0.00059, "completion": 0.00079},
         }
     )
+    # Optional per-provider spend windows. Each entry accepts limit_usd,
+    # window ("hourly" or "daily"), and an optional fallback_provider.
+    llm_provider_cost_ceilings: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
     # Request safety limits
     max_request_body_bytes: int = 10 * 1024 * 1024
@@ -124,6 +147,17 @@ class Settings(BaseSettings):
         }
     )
     rate_limit_enabled: bool = True
+
+    # Per-organization rate limiting (issue #1200)
+    # Organization IDs mapped to rate limit tiers (e.g., "org-123": "100/minute")
+    # Typically loaded from a database or configuration service at startup.
+    # Organizations not in this mapping have no org-level rate limit ceiling.
+    org_rate_limit_tiers: Dict[str, str] = Field(default_factory=dict)
+    # API key to organization ID mappings (e.g., "key-abc": "org-123")
+    # Typically loaded from a database or configuration service at startup.
+    api_key_to_org_mapping: Dict[str, str] = Field(default_factory=dict)
+    # Enable/disable organization-level rate limiting independently
+    org_rate_limit_enabled: bool = True
 
     # Circuit Breaker settings
     circuit_breaker_failure_threshold: int = 3
@@ -155,10 +189,23 @@ class Settings(BaseSettings):
     # lowest-latency-first without editing source.
     llm_provider_fallback_order: str = "openai,groq,test"
     ocr_provider_fallback_order: str = "test,tesseract"
+    # Capabilities are selected from this map before applying fallback order.
+    # Override with PROVIDER_CAPABILITY_MATRIX as a JSON object.
+    provider_capability_matrix: Dict[str, List[str]] = Field(
+        default_factory=lambda: {
+            provider: capabilities.copy()
+            for provider, capabilities in DEFAULT_PROVIDER_CAPABILITY_MATRIX.items()
+        }
+    )
 
     # Load shedding settings
     load_shed_memory_threshold_percent: float = 90.0
     load_shed_max_celery_queue_depth: int = 100
+    # Graduated queue depth thresholds for priority-based shedding
+    load_shed_high_celery_queue_depth: Optional[int] = 75
+    load_shed_low_celery_queue_depth: Optional[int] = 50
+    # Provider health threshold for degraded state (0.0-1.0)
+    load_shed_provider_degraded_threshold: float = 0.3
 
     # Dead-letter replay settings
     dead_letter_max_replay_attempts: int = 5
@@ -194,6 +241,26 @@ class Settings(BaseSettings):
     fraud_pass_max_score: float = 0.40
     fraud_review_max_score: float = 0.75
 
+    # OCR confidence banding / manual-review routing (issue #984).
+    # A low-confidence OCR extraction must not be treated as authoritative.
+    # The aggregate score is the mean of the per-field confidences in [0, 1];
+    # scores below ``ocr_confidence_review_threshold`` are flagged for review
+    # (band "low"), scores at/above ``ocr_confidence_high_threshold`` are band
+    # "high", and everything between is "medium".  A result carrying no
+    # confidence at all is always flagged for review.  Per-document-type
+    # overrides for the review threshold can be supplied as a JSON object in
+    # OCR_CONFIDENCE_THRESHOLDS_BY_DOCUMENT_TYPE.
+    ocr_confidence_review_threshold: float = 0.75
+    ocr_confidence_high_threshold: float = 0.90
+    ocr_confidence_thresholds_by_document_type: Dict[str, float] = Field(
+        default_factory=lambda: {
+            "id_card": 0.80,
+            "passport": 0.85,
+            "invoice": 0.70,
+            "receipt": 0.70,
+        }
+    )
+
     # Application settings
     app_env: Literal["development", "staging", "production", "test"] = "development"
     log_level: str = "INFO"
@@ -205,6 +272,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     task_max_retries: int = 3
     task_retry_delay_seconds: int = 30
+    # A job still waiting for a worker after this many seconds is marked
+    # timed_out on its next status poll instead of sitting queued forever
+    # (issue #1208). Only applies to jobs that have not started processing.
+    async_job_idle_timeout_seconds: float = 600.0
 
     # Backend webhook URL for notifications
     backend_webhook_url: HttpUrl = (
@@ -300,6 +371,16 @@ class Settings(BaseSettings):
             _add("OPENAI_API_KEY", "is set but blank")
         if self.groq_api_key is not None and not self.groq_api_key.strip():
             _add("GROQ_API_KEY", "is set but blank")
+        if (
+            self.openai_fallback_api_key is not None
+            and not self.openai_fallback_api_key.strip()
+        ):
+            _add("OPENAI_FALLBACK_API_KEY", "is set but blank")
+        if (
+            self.groq_fallback_api_key is not None
+            and not self.groq_fallback_api_key.strip()
+        ):
+            _add("GROQ_FALLBACK_API_KEY", "is set but blank")
 
         # --- Callback/webhook signing secret -----------------------------
         if self.ai_webhook_secret is not None:
@@ -343,12 +424,17 @@ class Settings(BaseSettings):
         # --- Numeric settings must be positive ---------------------------
         positive_numeric_settings = (
             ("LLM_TIMEOUT_SECONDS", self.llm_timeout_seconds),
+            (
+                "PROVIDER_HTTP_IDLE_TIMEOUT_SECONDS",
+                self.provider_http_idle_timeout_seconds,
+            ),
             ("MAX_REQUEST_BODY_BYTES", self.max_request_body_bytes),
             ("MAX_REQUEST_TIMEOUT_SECONDS", self.max_request_timeout_seconds),
             ("CACHE_TTL_TASK_STATUS", self.cache_ttl_task_status),
             ("CACHE_TTL_ARTIFACT_ACCESS", self.cache_ttl_artifact_access),
             ("CACHE_TTL_VERIFICATION", self.cache_ttl_verification),
             ("TASK_RETRY_DELAY_SECONDS", self.task_retry_delay_seconds),
+            ("ASYNC_JOB_IDLE_TIMEOUT_SECONDS", self.async_job_idle_timeout_seconds),
             (
                 "VERIFICATION_ARTIFACT_URL_TTL_SECONDS",
                 self.verification_artifact_url_ttl_seconds,
@@ -409,6 +495,38 @@ class Settings(BaseSettings):
                 f"{self.fraud_review_max_score})",
             )
 
+        # --- OCR confidence banding thresholds (issue #984) ---------------
+        if not 0.0 <= self.ocr_confidence_review_threshold <= 1.0:
+            _add(
+                "OCR_CONFIDENCE_REVIEW_THRESHOLD",
+                "must be between 0.0 and 1.0 "
+                f"(got {self.ocr_confidence_review_threshold})",
+            )
+        if not 0.0 <= self.ocr_confidence_high_threshold <= 1.0:
+            _add(
+                "OCR_CONFIDENCE_HIGH_THRESHOLD",
+                "must be between 0.0 and 1.0 "
+                f"(got {self.ocr_confidence_high_threshold})",
+            )
+        if self.ocr_confidence_review_threshold > self.ocr_confidence_high_threshold:
+            _add(
+                "OCR_CONFIDENCE_REVIEW_THRESHOLD / OCR_CONFIDENCE_HIGH_THRESHOLD",
+                "OCR_CONFIDENCE_REVIEW_THRESHOLD must not exceed "
+                "OCR_CONFIDENCE_HIGH_THRESHOLD (got "
+                f"{self.ocr_confidence_review_threshold} > "
+                f"{self.ocr_confidence_high_threshold})",
+            )
+        for (
+            document_type,
+            threshold,
+        ) in self.ocr_confidence_thresholds_by_document_type.items():
+            if not 0.0 <= threshold <= 1.0:
+                _add(
+                    "OCR_CONFIDENCE_THRESHOLDS_BY_DOCUMENT_TYPE",
+                    f"document type '{document_type}' threshold must be "
+                    f"between 0.0 and 1.0 (got {threshold})",
+                )
+
         # --- CORS origins: entries must be absolute origins --------------
         for key, raw in (
             ("CORS_ALLOWED_ORIGINS", self.cors_allowed_origins),
@@ -427,6 +545,7 @@ class Settings(BaseSettings):
         # config). The known-provider sets live next to the registry so they
         # remain the single source of truth.
         from services.providers import validate_fallback_order
+        from services.providers import validate_provider_capability_matrix
 
         for key, order in (
             ("LLM_PROVIDER_FALLBACK_ORDER", self.get_llm_fallback_order()),
@@ -436,6 +555,26 @@ class Settings(BaseSettings):
                 validate_fallback_order(key, order)
             except ValueError as exc:
                 _add(key, str(exc))
+
+        try:
+            validate_provider_capability_matrix(self.provider_capability_matrix)
+        except ValueError as exc:
+            _add("PROVIDER_CAPABILITY_MATRIX", str(exc))
+
+        for provider, ceiling in self.llm_provider_cost_ceilings.items():
+            key = "LLM_PROVIDER_COST_CEILINGS"
+            if provider not in {"openai", "groq"}:
+                _add(key, f"unknown provider '{provider}'")
+            limit_usd = ceiling.get("limit_usd")
+            if not isinstance(limit_usd, (int, float)) or limit_usd < 0:
+                _add(key, f"provider '{provider}' limit_usd must be non-negative")
+            if ceiling.get("window") not in {"hourly", "daily"}:
+                _add(key, f"provider '{provider}' window must be hourly or daily")
+            fallback = ceiling.get("fallback_provider")
+            if fallback is not None and fallback not in {"openai", "groq"}:
+                _add(key, f"provider '{provider}' has an unknown fallback_provider")
+            elif fallback == provider:
+                _add(key, f"provider '{provider}' cannot fall back to itself")
 
         # --- Per-model LLM cost rates --------------------------------------
         for model_name, rates in self.llm_model_cost_per_1k_tokens.items():
@@ -451,6 +590,44 @@ class Settings(BaseSettings):
                         "LLM_MODEL_COST_PER_1K_TOKENS",
                         f"model '{model_name}' has a negative '{direction}' rate",
                     )
+
+        provider_models = {"openai": self.openai_model, "groq": self.groq_model}
+        for provider, ceiling in self.llm_provider_cost_ceilings.items():
+            key = "LLM_PROVIDER_COST_CEILINGS"
+            provider_rates = self.llm_model_cost_per_1k_tokens.get(
+                provider_models.get(provider, ""), {}
+            )
+            if any(
+                provider_rates.get(direction) is None
+                for direction in ("prompt", "completion")
+            ):
+                _add(
+                    key,
+                    f"provider '{provider}' model must have configured prompt and completion rates",
+                )
+            fallback = ceiling.get("fallback_provider")
+            if fallback in provider_models:
+                fallback_rates = self.llm_model_cost_per_1k_tokens.get(
+                    provider_models[fallback], {}
+                )
+                if all(
+                    provider_rates.get(direction) is not None
+                    and fallback_rates.get(direction) is not None
+                    for direction in ("prompt", "completion")
+                ):
+                    no_more_expensive = all(
+                        fallback_rates[direction] <= provider_rates[direction]
+                        for direction in ("prompt", "completion")
+                    )
+                    strictly_cheaper = any(
+                        fallback_rates[direction] < provider_rates[direction]
+                        for direction in ("prompt", "completion")
+                    )
+                    if not no_more_expensive or not strictly_cheaper:
+                        _add(
+                            key,
+                            f"fallback '{fallback}' for provider '{provider}' must have lower configured token rates",
+                        )
 
         # --- Production requirements (defense in depth) ------------------
         # apply_environment_defaults already rejects this at construction
@@ -598,6 +775,41 @@ class Settings(BaseSettings):
                 return True
 
         return False
+
+    def reload_api_keys(self) -> None:
+        """Reload API keys from environment variables at runtime (issue #1411).
+
+        Updates the active primary and fallback API key configuration from
+        the current environment without requiring an application restart.
+        Existing in-flight requests continue with the keys they started with;
+        subsequent requests use the updated configuration.
+
+        This method is thread-safe and updates the configuration in-place
+        without creating a new Settings instance.
+        """
+        import os
+
+        # Reload primary and fallback keys from environment variables
+        self.openai_api_key = os.getenv("OPENAI_API_KEY") or None
+        self.groq_api_key = os.getenv("GROQ_API_KEY") or None
+        self.openai_fallback_api_key = os.getenv("OPENAI_FALLBACK_API_KEY") or None
+        self.groq_fallback_api_key = os.getenv("GROQ_FALLBACK_API_KEY") or None
+
+        # Validate the reloaded keys
+        if self.openai_api_key is not None and not self.openai_api_key.strip():
+            raise ValueError("OPENAI_API_KEY is set but blank")
+        if self.groq_api_key is not None and not self.groq_api_key.strip():
+            raise ValueError("GROQ_API_KEY is set but blank")
+        if (
+            self.openai_fallback_api_key is not None
+            and not self.openai_fallback_api_key.strip()
+        ):
+            raise ValueError("OPENAI_FALLBACK_API_KEY is set but blank")
+        if (
+            self.groq_fallback_api_key is not None
+            and not self.groq_fallback_api_key.strip()
+        ):
+            raise ValueError("GROQ_FALLBACK_API_KEY is set but blank")
 
 
 settings = Settings()

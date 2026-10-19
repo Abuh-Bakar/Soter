@@ -1,6 +1,7 @@
+import { AppException } from '../common/dto/error-response.dto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { ConflictException, NotFoundException } from '@nestjs/common';
+
 import { RetentionPolicyService } from './retention-policy.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
@@ -144,7 +145,7 @@ describe('RetentionPolicyService', () => {
 
       await expect(
         service.create({ entity: 'AuditLog', retentionDays: 90 }),
-      ).rejects.toThrow(ConflictException);
+      ).rejects.toThrow(AppException);
     });
   });
 
@@ -175,9 +176,7 @@ describe('RetentionPolicyService', () => {
 
     it('should throw NotFoundException if not found', async () => {
       prisma.retentionPolicy.findUnique.mockResolvedValue(null);
-      await expect(service.findOne('missing')).rejects.toThrow(
-        NotFoundException,
-      );
+      await expect(service.findOne('missing')).rejects.toThrow(AppException);
     });
   });
 
@@ -303,6 +302,46 @@ describe('RetentionPolicyService', () => {
       expect(results).toHaveLength(2);
       expect(results[0].affected).toBe(5);
       expect(results[1].affected).toBe(3);
+      expect(prisma.auditLog.updateMany).not.toHaveBeenCalled();
+      expect(prisma.verificationSession.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('generateDryRunReport covers multiple entities with samples and no mutation', async () => {
+      prisma.retentionPolicy.findMany.mockResolvedValue([
+        {
+          id: 'p1',
+          entity: 'AuditLog',
+          retentionDays: 90,
+          strategy: 'soft_delete',
+        },
+        {
+          id: 'p2',
+          entity: 'VerificationSession',
+          retentionDays: 30,
+          strategy: 'hard_delete',
+        },
+      ]);
+      prisma.auditLog.count.mockResolvedValue(2);
+      prisma.verificationSession.count.mockResolvedValue(1);
+      prisma.auditLog.findMany.mockResolvedValue([{ id: 'a1' }, { id: 'a2' }]);
+      prisma.verificationSession.findMany.mockResolvedValue([{ id: 'v1' }]);
+
+      const report = await service.generateDryRunReport(5);
+
+      expect(report.dryRun).toBe(true);
+      expect(report.totalAffected).toBe(3);
+      expect(report.entries).toEqual([
+        expect.objectContaining({
+          entity: 'AuditLog',
+          affected: 2,
+          sampleIds: ['a1', 'a2'],
+        }),
+        expect.objectContaining({
+          entity: 'VerificationSession',
+          affected: 1,
+          sampleIds: ['v1'],
+        }),
+      ]);
       expect(prisma.auditLog.updateMany).not.toHaveBeenCalled();
       expect(prisma.verificationSession.deleteMany).not.toHaveBeenCalled();
     });

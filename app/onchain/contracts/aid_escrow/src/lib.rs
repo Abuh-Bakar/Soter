@@ -37,13 +37,15 @@ pub use crate::keys::{
     package_index_entry, package_key, KEY_ADMIN, KEY_CAMPAIGN_PAUSED, KEY_CAMPAIGN_TOKEN_CLAIMED,
     KEY_CAMPAIGN_TOKEN_LOCKED, KEY_CONFIG, KEY_DELEGATES, KEY_DELEGATE_EXPIRY,
     KEY_DELEGATE_HISTORY, KEY_DISTRIBUTORS, KEY_MAX_DISTRIBUTORS, KEY_PAUSED, KEY_PAUSE_CLAIM,
-    KEY_PAUSE_CREATE, KEY_PAUSE_REFUND, KEY_PAUSE_WITHDRAW, KEY_PENDING_ADMIN, KEY_PKG_COUNTER,
-    KEY_PKG_IDX, KEY_RECIPIENT_LAST_CLAIM, KEY_TOTAL_CLAIMED, KEY_TOTAL_LOCKED, KEY_VERSION,
+    KEY_PAUSE_CREATE, KEY_PAUSE_REFUND, KEY_PAUSE_WITHDRAW, KEY_PENDING_ADMIN,
+    KEY_PENDING_WITHDRAWAL, KEY_PKG_COUNTER, KEY_PKG_IDX, KEY_RECIPIENT_LAST_CLAIM,
+    KEY_SURPLUS_WITHDRAWAL_STALENESS, KEY_TOTAL_CLAIMED, KEY_TOTAL_LOCKED, KEY_VERSION,
 };
 
 /// Upper bound on the number of package ids accepted by `batch_claim` in a
 /// single invocation, keeping the call within Soroban resource limits.
 pub const MAX_BATCH_CLAIM_SIZE: u32 = 25;
+pub const MAX_BATCH_REVOKE_REFUND_SIZE: u32 = 25;
 
 /// Maximum number of package IDs that `list_recipient_packages` may return in
 /// a single call.  Enforcing this keeps the response within Soroban's read-entry
@@ -112,6 +114,31 @@ pub struct Aggregates {
     pub total_expired_cancelled: i128,
 }
 
+/// Minimum delay (in seconds) that must elapse between proposing a surplus
+/// withdrawal and executing it.  Set to 24 hours (86 400 s) to give
+/// observers a meaningful observation window.
+pub const SURPLUS_WITHDRAWAL_DELAY_SECS: u64 = 86_400;
+
+/// Default maximum age of a pending surplus withdrawal before it can be
+/// swept. This is measured from proposal time, independently of the 24-hour
+/// execution timelock.
+pub const DEFAULT_SURPLUS_WITHDRAWAL_STALENESS_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// A proposed but not-yet-executed surplus withdrawal, stored under
+/// `KEY_PENDING_WITHDRAWAL` in instance storage.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingWithdrawal {
+    /// Destination address for the transfer.
+    pub to: Address,
+    /// Token address for the withdrawal.
+    pub token: Address,
+    /// Amount (in smallest token units) to withdraw.
+    pub amount: i128,
+    /// Earliest ledger timestamp at which `execute_surplus_withdrawal` may be called.
+    pub executable_at: u64,
+}
+
 /// Outcome of a single package claim attempt made as part of a `batch_claim`
 /// call. `batch_claim` never fails a whole batch because one package could
 /// not be claimed; instead each id resolves to one of these statuses.
@@ -151,6 +178,28 @@ pub struct BatchClaimResult {
     pub amount: i128,
 }
 
+/// Outcome of one package revoke or refund attempt in a batch.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum BatchAdminActionStatus {
+    Success = 0,
+    NotFound = 1,
+    InvalidState = 2,
+    Expired = 3,
+    NotExpired = 4,
+    CampaignPaused = 5,
+    TransferFailed = 6,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchAdminActionResult {
+    pub package_id: u64,
+    pub status: BatchAdminActionStatus,
+    pub amount: i128,
+}
+
 #[contracterror]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
@@ -187,6 +236,25 @@ pub enum Error {
     /// `add_distributor` would exceed the configured maximum distributor
     /// set size (see `get_max_distributors` / `set_max_distributors`).
     DistributorSetFull = 25,
+    /// `propose_surplus_withdrawal` was called while a withdrawal proposal
+    /// is already pending.  Cancel the existing proposal first.
+    SurplusWithdrawalPending = 26,
+    /// `cancel_surplus_withdrawal` or `execute_surplus_withdrawal` was called
+    /// when no withdrawal proposal is currently pending.
+    SurplusWithdrawalNotPending = 27,
+    /// `execute_surplus_withdrawal` was called before the timelock delay has
+    /// elapsed.  Wait until `executable_at` and try again.
+    SurplusWithdrawalTimelockActive = 28,
+    /// Package metadata included a `merkle_root` value that is not a
+    /// well-formed 64-character hex string (32 bytes). Rejected at creation
+    /// time so a malformed root can never silently disable the allowlist
+    /// gate (see `merkle_root_from_metadata`, which would otherwise treat
+    /// it as "no Merkle gate configured").
+    InvalidMerkleRoot = 29,
+    /// A staleness period must exceed the execution timelock.
+    InvalidSurplusWithdrawalStaleness = 30,
+    /// A pending withdrawal has not yet reached its configured staleness age.
+    SurplusWithdrawalNotStale = 31,
 }
 
 // --- Contract Events (indexer-friendly; stable topics & payloads) ---
@@ -314,6 +382,40 @@ pub struct SurplusWithdrawnEvent {
     pub to: Address,
     pub token: Address,
     pub amount: i128,
+}
+
+/// Emitted when an admin proposes a surplus withdrawal (starts the timelock).
+#[contractevent]
+pub struct SurplusWithdrawalProposed {
+    pub schema_version: u32,
+    pub to: Address,
+    pub token: Address,
+    pub amount: i128,
+    /// Earliest timestamp at which the proposal may be executed.
+    pub executable_at: u64,
+    pub timestamp: u64,
+}
+
+/// Emitted when an admin cancels a pending surplus withdrawal proposal.
+#[contractevent]
+pub struct SurplusWithdrawalCancelled {
+    pub schema_version: u32,
+    pub to: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Emitted when a stale pending surplus withdrawal is cleared. Sweeping does
+/// not transfer funds; it only removes the abandoned proposal.
+#[contractevent]
+pub struct SurplusWithdrawalSwept {
+    pub schema_version: u32,
+    pub to: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub proposed_at: u64,
+    pub timestamp: u64,
 }
 
 #[contractevent]
@@ -1204,6 +1306,8 @@ impl AidEscrow {
             }
         }
 
+        Self::validate_merkle_root_metadata(&env, &metadata)?;
+
         let key = crate::keys::package_key(id);
         if env.storage().persistent().has(&key) {
             return Err(Error::PackageIdExists);
@@ -1349,6 +1453,8 @@ impl AidEscrow {
             if claim_starts_at > expires_at {
                 return Err(Error::InvalidState);
             }
+
+            Self::validate_merkle_root_metadata(&env, &metadata)?;
 
             // Validate amount
             if amount <= 0 {
@@ -1815,6 +1921,147 @@ impl AidEscrow {
     }
 
     /// Admin revokes a package (Cancels it). Funds are effectively unlocked but remain in contract pool.
+    ///
+    /// Each id is evaluated independently. A failed item does not prevent
+    /// other items from being revoked, and retrying a successful item returns
+    /// `InvalidState` without changing accounting.
+    pub fn batch_revoke(env: Env, ids: Vec<u64>) -> Result<Vec<BatchAdminActionResult>, Error> {
+        if ids.len() > MAX_BATCH_REVOKE_REFUND_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let admin = Self::get_admin(env.clone())?;
+        admin.require_auth();
+
+        let mut results = Vec::new(&env);
+        for id in ids.iter() {
+            results.push_back(Self::revoke_one_for_batch(&env, &admin, id));
+        }
+        Ok(results)
+    }
+
+    /// Admin refunds multiple expired or cancelled packages. Each id is
+    /// evaluated independently and successful transfers update accounting
+    /// before the next id is processed.
+    pub fn batch_refund(env: Env, ids: Vec<u64>) -> Result<Vec<BatchAdminActionResult>, Error> {
+        Self::check_action_paused(&env, symbol_short!("refund"))?;
+        if ids.len() > MAX_BATCH_REVOKE_REFUND_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let admin = Self::get_admin(env.clone())?;
+        admin.require_auth();
+
+        let now = env.ledger().timestamp();
+        let mut results = Vec::new(&env);
+        for id in ids.iter() {
+            results.push_back(Self::refund_one_for_batch(&env, &admin, id, now));
+        }
+        Ok(results)
+    }
+
+    fn revoke_one_for_batch(env: &Env, admin: &Address, id: u64) -> BatchAdminActionResult {
+        let key = crate::keys::package_key(id);
+        let mut package: Package = match env.storage().persistent().get(&key) {
+            Some(package) => package,
+            None => return Self::batch_action_result(id, BatchAdminActionStatus::NotFound, 0),
+        };
+
+        if package.status != PackageStatus::Created {
+            return Self::batch_action_result(id, BatchAdminActionStatus::InvalidState, 0);
+        }
+
+        let amount = package.amount;
+        package.status = PackageStatus::Cancelled;
+        env.storage().persistent().set(&key, &package);
+        Self::decrement_locked(env, &package.token, &package.metadata, amount);
+
+        PackageRevoked {
+            schema_version: EVENT_SCHEMA_VERSION,
+            package_id: id,
+            recipient: package.recipient,
+            amount,
+            actor: admin.clone(),
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(env);
+
+        Self::batch_action_result(id, BatchAdminActionStatus::Success, amount)
+    }
+
+    fn refund_one_for_batch(
+        env: &Env,
+        admin: &Address,
+        id: u64,
+        now: u64,
+    ) -> BatchAdminActionResult {
+        let key = crate::keys::package_key(id);
+        let mut package: Package = match env.storage().persistent().get(&key) {
+            Some(package) => package,
+            None => return Self::batch_action_result(id, BatchAdminActionStatus::NotFound, 0),
+        };
+
+        if Self::check_campaign_paused(env, &package.metadata).is_err() {
+            return Self::batch_action_result(id, BatchAdminActionStatus::CampaignPaused, 0);
+        }
+
+        let should_unlock_locked =
+            package.status == PackageStatus::Created || package.status == PackageStatus::Expired;
+
+        if package.status == PackageStatus::Created {
+            if package.expires_at == 0 || now <= package.expires_at {
+                return Self::batch_action_result(id, BatchAdminActionStatus::NotExpired, 0);
+            }
+        } else if package.status != PackageStatus::Expired
+            && package.status != PackageStatus::Cancelled
+        {
+            return Self::batch_action_result(id, BatchAdminActionStatus::InvalidState, 0);
+        }
+
+        if Self::transfer_token(
+            env,
+            &package.token,
+            &env.current_contract_address(),
+            admin,
+            &package.amount,
+        )
+        .is_err()
+        {
+            return Self::batch_action_result(id, BatchAdminActionStatus::TransferFailed, 0);
+        }
+
+        let amount = package.amount;
+        if should_unlock_locked {
+            Self::decrement_locked(env, &package.token, &package.metadata, amount);
+        }
+        package.status = PackageStatus::Refunded;
+        env.storage().persistent().set(&key, &package);
+
+        PackageRefunded {
+            schema_version: EVENT_SCHEMA_VERSION,
+            package_id: id,
+            recipient: package.recipient,
+            amount,
+            actor: admin.clone(),
+            timestamp: now,
+        }
+        .publish(env);
+
+        Self::batch_action_result(id, BatchAdminActionStatus::Success, amount)
+    }
+
+    fn batch_action_result(
+        package_id: u64,
+        status: BatchAdminActionStatus,
+        amount: i128,
+    ) -> BatchAdminActionResult {
+        BatchAdminActionResult {
+            package_id,
+            status,
+            amount,
+        }
+    }
+
     pub fn revoke(env: Env, id: u64) -> Result<(), Error> {
         let admin = Self::get_admin(env.clone())?;
         admin.require_auth();
@@ -2097,56 +2344,238 @@ impl AidEscrow {
         Ok(())
     }
 
-    /// Admin-only function to withdraw surplus (unallocated) funds from the contract.
-    /// Requirements: Admin auth, valid amount, sufficient surplus available.
-    /// Behavior: Transfers amount of token from contract to the specified address.
-    pub fn withdraw_surplus(
+    /// Admin-only. Proposes a surplus withdrawal and starts the timelock.
+    ///
+    /// The proposal is stored in instance storage.  Only one proposal may be
+    /// live at a time; call `cancel_surplus_withdrawal` to replace it.
+    /// After `SURPLUS_WITHDRAWAL_DELAY_SECS` seconds have elapsed the admin
+    /// may call `execute_surplus_withdrawal` to complete the transfer.
+    ///
+    /// # Arguments
+    /// * `to`     — Destination address for the funds.
+    /// * `amount` — Amount in smallest token units (must be > 0).
+    /// * `token`  — Token contract address (must be on the allowlist).
+    ///
+    /// # Errors
+    /// * `ContractPaused`           — contract or withdraw action is paused.
+    /// * `InvalidAmount`            — `amount` ≤ 0.
+    /// * `InvalidToken`             — token not on the allowlist.
+    /// * `InsufficientSurplus`      — requested amount exceeds available surplus.
+    /// * `SurplusWithdrawalPending` — a proposal already exists.
+    pub fn propose_surplus_withdrawal(
         env: Env,
         to: Address,
         amount: i128,
         token: Address,
     ) -> Result<(), Error> {
         Self::check_action_paused(&env, symbol_short!("withdraw"))?;
-        // 1. Only the admin can withdraw surplus
         let admin = Self::get_admin(env.clone())?;
         admin.require_auth();
 
-        // 2. Validate amount
+        // Validate amount
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
 
-        // 3. Get contract's current balance for the token
+        // Reject if a proposal is already pending
+        if env.storage().instance().has(&KEY_PENDING_WITHDRAWAL) {
+            return Err(Error::SurplusWithdrawalPending);
+        }
+
+        // Validate token and verify sufficient surplus exists right now
         Self::validate_token(&env, &token)?;
         let contract_balance = Self::token_balance(&env, &token, &env.current_contract_address())?;
-
-        // 4. Get total locked amount for the token
         let locked_map: Map<Address, i128> = env
             .storage()
             .instance()
             .get(&KEY_TOTAL_LOCKED)
             .unwrap_or(Map::new(&env));
         let total_locked = locked_map.get(token.clone()).unwrap_or(0);
-
-        // 5. Calculate available surplus and validate
         let available_surplus = contract_balance - total_locked;
         if amount > available_surplus {
             return Err(Error::InsufficientSurplus);
         }
 
-        // 6. Transfer funds from contract to recipient
-        Self::transfer_token(&env, &token, &env.current_contract_address(), &to, &amount)?;
+        let now = env.ledger().timestamp();
+        let executable_at = now + SURPLUS_WITHDRAWAL_DELAY_SECS;
 
-        // 7. Emit event
-        SurplusWithdrawnEvent {
-            schema_version: EVENT_SCHEMA_VERSION,
+        let proposal = PendingWithdrawal {
             to: to.clone(),
             token: token.clone(),
             amount,
+            executable_at,
+        };
+        env.storage()
+            .instance()
+            .set(&KEY_PENDING_WITHDRAWAL, &proposal);
+
+        SurplusWithdrawalProposed {
+            schema_version: EVENT_SCHEMA_VERSION,
+            to,
+            token,
+            amount,
+            executable_at,
+            timestamp: now,
         }
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Admin-only. Cancels a pending surplus withdrawal proposal.
+    ///
+    /// # Errors
+    /// * `SurplusWithdrawalNotPending` — no proposal currently exists.
+    pub fn cancel_surplus_withdrawal(env: Env) -> Result<(), Error> {
+        let admin = Self::get_admin(env.clone())?;
+        admin.require_auth();
+
+        let proposal: PendingWithdrawal = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING_WITHDRAWAL)
+            .ok_or(Error::SurplusWithdrawalNotPending)?;
+
+        env.storage().instance().remove(&KEY_PENDING_WITHDRAWAL);
+
+        SurplusWithdrawalCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            to: proposal.to,
+            token: proposal.token,
+            amount: proposal.amount,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Sets the maximum proposal age before a pending surplus withdrawal can
+    /// be swept. The window is measured from proposal time and must exceed the
+    /// execution timelock so an eligible proposal always has time to execute.
+    pub fn set_surplus_staleness_secs(env: Env, staleness_secs: u64) -> Result<(), Error> {
+        let admin = Self::get_admin(env.clone())?;
+        admin.require_auth();
+        if staleness_secs <= SURPLUS_WITHDRAWAL_DELAY_SECS {
+            return Err(Error::InvalidSurplusWithdrawalStaleness);
+        }
+        env.storage()
+            .instance()
+            .set(&KEY_SURPLUS_WITHDRAWAL_STALENESS, &staleness_secs);
+        Ok(())
+    }
+
+    /// Returns the configured maximum age for pending surplus withdrawals.
+    pub fn get_surplus_staleness_secs(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&KEY_SURPLUS_WITHDRAWAL_STALENESS)
+            .unwrap_or(DEFAULT_SURPLUS_WITHDRAWAL_STALENESS_SECS)
+    }
+
+    /// Permissionlessly clears an abandoned surplus withdrawal after its
+    /// configured maximum age. The proposal timestamp is derived from the
+    /// stored execution time, preserving compatibility with existing records.
+    pub fn sweep_stale_surplus_withdrawal(env: Env) -> Result<(), Error> {
+        let proposal: PendingWithdrawal = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING_WITHDRAWAL)
+            .ok_or(Error::SurplusWithdrawalNotPending)?;
+        let proposed_at = proposal
+            .executable_at
+            .saturating_sub(SURPLUS_WITHDRAWAL_DELAY_SECS);
+        let staleness_secs = Self::get_surplus_staleness_secs(env.clone());
+        let stale_at = proposed_at.saturating_add(staleness_secs);
+        let now = env.ledger().timestamp();
+        if now < stale_at {
+            return Err(Error::SurplusWithdrawalNotStale);
+        }
+
+        env.storage().instance().remove(&KEY_PENDING_WITHDRAWAL);
+        SurplusWithdrawalSwept {
+            schema_version: EVENT_SCHEMA_VERSION,
+            to: proposal.to,
+            token: proposal.token,
+            amount: proposal.amount,
+            proposed_at,
+            timestamp: now,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Admin-only. Executes a pending surplus withdrawal after the timelock
+    /// delay has elapsed.
+    ///
+    /// Validates that surplus is still sufficient at execution time (token
+    /// balance may have changed since the proposal was made), then transfers
+    /// the funds and removes the proposal.
+    ///
+    /// # Errors
+    /// * `ContractPaused`                — contract or withdraw action is paused.
+    /// * `SurplusWithdrawalNotPending`   — no proposal currently exists.
+    /// * `SurplusWithdrawalTimelockActive` — delay has not yet elapsed.
+    /// * `InsufficientSurplus`           — surplus shrank below requested amount.
+    /// * `InvalidToken`                  — token is no longer on the allowlist.
+    pub fn execute_surplus_withdrawal(env: Env) -> Result<(), Error> {
+        Self::check_action_paused(&env, symbol_short!("withdraw"))?;
+        let admin = Self::get_admin(env.clone())?;
+        admin.require_auth();
+
+        let proposal: PendingWithdrawal = env
+            .storage()
+            .instance()
+            .get(&KEY_PENDING_WITHDRAWAL)
+            .ok_or(Error::SurplusWithdrawalNotPending)?;
+
+        // Enforce the timelock delay
+        let now = env.ledger().timestamp();
+        if now < proposal.executable_at {
+            return Err(Error::SurplusWithdrawalTimelockActive);
+        }
+
+        // Re-validate surplus at execution time
+        Self::validate_token(&env, &proposal.token)?;
+        let contract_balance =
+            Self::token_balance(&env, &proposal.token, &env.current_contract_address())?;
+        let locked_map: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&KEY_TOTAL_LOCKED)
+            .unwrap_or(Map::new(&env));
+        let total_locked = locked_map.get(proposal.token.clone()).unwrap_or(0);
+        let available_surplus = contract_balance - total_locked;
+        if proposal.amount > available_surplus {
+            return Err(Error::InsufficientSurplus);
+        }
+
+        // Remove the proposal before transferring (checks-effects-interactions)
+        env.storage().instance().remove(&KEY_PENDING_WITHDRAWAL);
+
+        // Transfer funds
+        Self::transfer_token(
+            &env,
+            &proposal.token,
+            &env.current_contract_address(),
+            &proposal.to,
+            &proposal.amount,
+        )?;
+
+        SurplusWithdrawnEvent {
+            schema_version: EVENT_SCHEMA_VERSION,
+            to: proposal.to,
+            token: proposal.token,
+            amount: proposal.amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the pending surplus withdrawal proposal, if one exists.
+    pub fn get_pending_withdrawal(env: Env) -> Option<PendingWithdrawal> {
+        env.storage().instance().get(&KEY_PENDING_WITHDRAWAL)
     }
 
     // --- Helpers ---
@@ -2564,6 +2993,23 @@ impl AidEscrow {
         metadata
             .get(root_key)
             .and_then(|hex| Self::parse_hex_32(&hex))
+    }
+
+    /// Rejects package metadata whose `merkle_root` value (if present) is not
+    /// well-formed 32-byte hex. Called at package-creation time so a typo'd
+    /// or malformed root can never be stored: `merkle_root_from_metadata`
+    /// treats any unparseable value as "no Merkle gate configured", which
+    /// would otherwise silently downgrade an intended allowlist-only package
+    /// into one claimable directly by its `recipient`.
+    fn validate_merkle_root_metadata(
+        env: &Env,
+        metadata: &Map<Symbol, String>,
+    ) -> Result<(), Error> {
+        let root_key = Symbol::new(env, keys::META_MERKLE_ROOT_KEY);
+        match metadata.get(root_key) {
+            Some(hex) if Self::parse_hex_32(&hex).is_none() => Err(Error::InvalidMerkleRoot),
+            _ => Ok(()),
+        }
     }
 
     fn verify_merkle_proof_for_claimant(
@@ -3282,13 +3728,13 @@ impl AidEscrow {
                 break;
             }
 
-            let idx_key = (symbol_short!("pidx"), i);
+            let idx_key = package_index_entry(i);
             let pkg_id: u64 = match env.storage().persistent().get(&idx_key) {
                 Some(id) => id,
                 None => continue,
             };
 
-            let pkg_key = (symbol_short!("pkg"), pkg_id);
+            let pkg_key = package_key(pkg_id);
             let mut package: Package = match env.storage().persistent().get(&pkg_key) {
                 Some(package) => package,
                 None => continue,

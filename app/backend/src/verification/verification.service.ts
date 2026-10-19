@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { Request } from 'express';
@@ -31,8 +31,13 @@ import * as crypto from 'crypto';
 import { CircuitBreaker } from '../common/utils/circuit-breaker.util';
 import { VerificationMetadataService } from './metadata.service';
 import { VerificationResultDto } from './dto/verification-result.dto';
+import {
+  mergeClaimAnchorMetadata,
+  toPersistedVerificationResult,
+} from './verification-result.persistence';
 import { CorrelationPropagationUtil } from '../common/utils/correlation-propagation.util';
 import { MetricsService } from '../observability/metrics/metrics.service';
+import { AnalyticsService } from '../analytics/analytics.service';
 
 // ---------------------------------------------------------------------------
 // OCR service types
@@ -150,6 +155,7 @@ export class VerificationService {
     private readonly verificationMetadataService: VerificationMetadataService,
     private readonly correlationUtil: CorrelationPropagationUtil,
     private readonly metricsService: MetricsService,
+    @Optional() private readonly analyticsService?: AnalyticsService,
   ) {
     this.verificationMode =
       this.configService.get<string>('VERIFICATION_MODE') || 'mock';
@@ -330,26 +336,38 @@ export class VerificationService {
     const shouldVerify = enhancedResult.score >= this.verificationThreshold;
 
     // Build anchor metadata to persist
-    const anchorMetadataToPersist = anchorMetadata
-      ? {
-          campaignRef: anchorMetadata.campaignRef ?? null,
-          claimId: anchorMetadata.claimId ?? null,
-          packageId: anchorMetadata.packageId ?? null,
-          contractId: anchorMetadata.contractId ?? null,
-        }
-      : null;
+    const anchorMetadataToPersist: Prisma.InputJsonObject | null =
+      anchorMetadata
+        ? {
+            campaignRef: anchorMetadata.campaignRef ?? null,
+            claimId: anchorMetadata.claimId ?? null,
+            packageId: anchorMetadata.packageId ?? null,
+            contractId: anchorMetadata.contractId ?? null,
+          }
+        : null;
 
-    // Update claim with verification result including metadata
+    // Persist the outcome on the claim itself. The claim row - not the queue,
+    // and not an in-flight job - is what operators read and what
+    // ClaimsService.verify() gates on, so a completed verification is only
+    // durable once it lands here. The write merges, so it can neither erase
+    // the anchor metadata the AI service wrote nor an earlier outcome.
+    const persistedVerification = toPersistedVerificationResult(
+      enhancedResult,
+      this.verificationThreshold,
+    );
+
     await this.prisma.claim.update({
       where: { id: claimId },
       data: {
         status: shouldVerify ? 'verified' : 'requested',
-        anchorMetadata:
-          anchorMetadataToPersist === null
-            ? Prisma.JsonNull
-            : (anchorMetadataToPersist as Prisma.InputJsonValue),
+        anchorMetadata: mergeClaimAnchorMetadata(
+          claim.anchorMetadata,
+          anchorMetadataToPersist,
+          persistedVerification,
+        ),
       },
     });
+    await this.analyticsService?.invalidateCache('claim_updated');
 
     this.logger.log(
       `Claim ${claimId} verification completed – score ${enhancedResult.score} ` +

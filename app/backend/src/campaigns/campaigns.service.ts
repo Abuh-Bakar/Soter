@@ -1,8 +1,5 @@
-import {
-  Injectable,
-  NotFoundException,
-  BadRequestException,
-} from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   CampaignStatus,
   ClaimStatus,
@@ -15,6 +12,7 @@ import { UpdateCampaignDto } from './dto/update-campaign.dto';
 import { ExportCampaignsQueryDto } from './dto/export-campaigns.dto';
 import { escapeCsvField, toCsvRow } from '../common/csv/csv.util';
 import { streamCursorPaginated } from '../common/streaming/cursor-paginate';
+import { AnalyticsService } from '../analytics/analytics.service';
 
 export interface CampaignExportRow {
   id: string;
@@ -58,7 +56,22 @@ export interface CampaignTimelineMilestone {
 
 @Injectable()
 export class CampaignsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(CampaignsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly analyticsService?: AnalyticsService,
+  ) {}
+
+  private async invalidateDashboardSummary(reason: string) {
+    try {
+      await this.analyticsService?.invalidateCache(reason);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to invalidate dashboard summary cache after ${reason}: ${String(error)}`,
+      );
+    }
+  }
 
   private sanitizeMetadata(
     metadata?: Record<string, unknown>,
@@ -68,7 +81,7 @@ export class CampaignsService {
   }
 
   async create(dto: CreateCampaignDto, ngoId?: string | null) {
-    return this.prisma.campaign.create({
+    const created = await this.prisma.campaign.create({
       data: {
         name: dto.name,
         status: dto.status ?? CampaignStatus.draft,
@@ -77,6 +90,9 @@ export class CampaignsService {
         ngoId: ngoId ?? null,
       },
     });
+
+    await this.invalidateDashboardSummary('campaign_updated');
+    return created;
   }
 
   async findAll(includeArchived = false, ngoId?: string | null) {
@@ -97,7 +113,7 @@ export class CampaignsService {
       where: { id },
     });
     if (!campaign || (campaign as { deletedAt?: Date | null }).deletedAt) {
-      throw new NotFoundException('Campaign not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Campaign not found');
     }
     return campaign;
   }
@@ -118,7 +134,7 @@ export class CampaignsService {
     });
 
     if (!campaign || campaign.deletedAt) {
-      throw new NotFoundException('Campaign not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Campaign not found');
     }
 
     const allTransactions = campaign.claims.flatMap(claim =>
@@ -217,7 +233,7 @@ export class CampaignsService {
   async update(id: string, dto: UpdateCampaignDto) {
     await this.findOne(id);
 
-    return this.prisma.campaign.update({
+    const updated = await this.prisma.campaign.update({
       where: { id },
       data: {
         name: dto.name,
@@ -229,6 +245,9 @@ export class CampaignsService {
             : this.sanitizeMetadata(dto.metadata),
       },
     });
+
+    await this.invalidateDashboardSummary('campaign_updated');
+    return updated;
   }
 
   private latestTransaction<
@@ -279,16 +298,20 @@ export class CampaignsService {
       data: { archivedAt: new Date(), status: CampaignStatus.archived },
     });
 
+    await this.invalidateDashboardSummary('campaign_updated');
     return { campaign: updated, alreadyArchived: false };
   }
 
   /** Soft-delete a campaign (sets deletedAt). */
   async softDelete(id: string) {
     await this.findOne(id);
-    return this.prisma.campaign.update({
+    const deleted = await this.prisma.campaign.update({
       where: { id },
       data: { deletedAt: new Date() },
     });
+
+    await this.invalidateDashboardSummary('campaign_updated');
+    return deleted;
   }
 
   /** Batch size used when streaming exports; bounds memory to O(batch), not O(total rows). */
@@ -310,10 +333,18 @@ export class CampaignsService {
 
     if (query.from || query.to) {
       if (query.from && isNaN(Date.parse(query.from))) {
-        throw new BadRequestException(`Invalid 'from' date: ${query.from}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'from' date: ${query.from}`,
+        );
       }
       if (query.to && isNaN(Date.parse(query.to))) {
-        throw new BadRequestException(`Invalid 'to' date: ${query.to}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'to' date: ${query.to}`,
+        );
       }
       where.createdAt = {};
       if (query.from) where.createdAt.gte = new Date(query.from);

@@ -1,13 +1,16 @@
+import { AppException } from '../common/dto/error-response.dto';
 import { Test } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+
 import { Campaign, CampaignStatus, Prisma } from '@prisma/client';
 import { CampaignsService, CampaignExportRow } from './campaigns.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { DeepMockProxy, mockDeep } from 'jest-mock-extended';
+import { AnalyticsService } from '../analytics/analytics.service';
 
 describe('CampaignsService', () => {
   let service: CampaignsService;
   let prismaMock: DeepMockProxy<PrismaService>;
+  let analyticsServiceMock: { invalidateCache: jest.Mock };
 
   const now = new Date('2026-01-25T00:00:00.000Z');
 
@@ -28,11 +31,13 @@ describe('CampaignsService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     prismaMock = mockDeep<PrismaService>();
+    analyticsServiceMock = { invalidateCache: jest.fn() };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
         CampaignsService,
         { provide: PrismaService, useValue: prismaMock },
+        { provide: AnalyticsService, useValue: analyticsServiceMock },
       ],
     }).compile();
 
@@ -75,6 +80,9 @@ describe('CampaignsService', () => {
 
     const createArgs = prismaMock.campaign.create.mock.calls[0]?.[0];
     expect(createArgs?.data).toMatchObject({ ngoId: 'ngo-1' });
+    expect(analyticsServiceMock.invalidateCache).toHaveBeenCalledWith(
+      'campaign_updated',
+    );
   });
 
   it('findAll(): excludes archived and deleted campaigns by default', async () => {
@@ -107,9 +115,7 @@ describe('CampaignsService', () => {
   it('findOne(): throws NotFoundException when missing', async () => {
     prismaMock.campaign.findUnique.mockResolvedValue(null);
 
-    await expect(service.findOne('missing')).rejects.toBeInstanceOf(
-      NotFoundException,
-    );
+    await expect(service.findOne('missing')).rejects.toThrow(AppException);
   });
 
   it('findOne(): throws NotFoundException when soft-deleted', async () => {
@@ -118,9 +124,7 @@ describe('CampaignsService', () => {
       deletedAt: now,
     });
 
-    await expect(service.findOne('c1')).rejects.toBeInstanceOf(
-      NotFoundException,
-    );
+    await expect(service.findOne('c1')).rejects.toThrow(AppException);
   });
 
   it('update(): throws NotFoundException if campaign does not exist', async () => {
@@ -128,7 +132,7 @@ describe('CampaignsService', () => {
 
     await expect(
       service.update('missing', { name: 'New Name' }),
-    ).rejects.toBeInstanceOf(NotFoundException);
+    ).rejects.toThrow(AppException);
 
     expect(prismaMock.campaign.update.mock.calls.length).toBe(0);
   });
@@ -194,9 +198,9 @@ describe('CampaignsService', () => {
     });
 
     it('countExport(): rejects an invalid date filter', async () => {
-      await expect(
-        service.countExport({ from: 'not-a-date' }),
-      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(service.countExport({ from: 'not-a-date' })).rejects.toThrow(
+        AppException,
+      );
     });
 
     it('streamExportRows(): pages through results with cursor-based pagination', async () => {
